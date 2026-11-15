@@ -1,0 +1,5 @@
+# Example Hermes profile snippet routing to LiteLLM -> LLM Web Bridge
+model:
+  default: gemini-browser
+  provider: custom
+  base_url: http://YOUR_LITELLM_HOST:4000/v1

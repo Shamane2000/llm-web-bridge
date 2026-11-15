@@ -1,0 +1,7 @@
+model_list:
+  - model_name: gemini-browser
+    litellm_params:
+      model: openai/gemini-browser
+      api_base: http://YOUR_BRIDGE_HOST:8765/v1
+      api_key: "sk-local-bridge-dummy"
+      timeout: 180
