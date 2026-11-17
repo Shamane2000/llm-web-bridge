@@ -6,7 +6,7 @@ Verbindet Google Gemini im Browser über Tampermonkey mit dem lokalen Linux-Term
 und bietet ein vollständiges Mission-Control Command-Center.
 
 Port: 8765
-Autor: Jarvis & Frank
+Autor: Remote-Host & User
 """
 
 import base64
@@ -36,16 +36,226 @@ STATS_DB_PATH = os.path.join(DOWNLOADS_DIR, "bridge_stats.db")
 os.makedirs(SCRATCH_DIR, exist_ok=True)
 os.makedirs(IMAGES_DIR, exist_ok=True)
 
-# Event für synchrone OpenAI / LiteLLM Antworten
+# Event für synchrone OpenAI / LiteLLM Antworten (Legacy-Alias + Provider-Slots)
 MISSION_COMPLETED_EVENT = threading.Event()
-# Mutex-Lock für strikte Serialisierung (Queueing) aller parallelen Anfragen
 MISSION_LOCK = threading.Lock()
 STATS_LOCK = threading.Lock()
 TABS_LOCK = threading.Lock()
-ACTIVE_TABS = {}  # tab_id -> {"role": str, "last_seen": float}
+ACTIVE_TABS = {}  # tab_id -> {"role": str, "provider": str, "last_seen": float}
+TAB_COMMANDS_LOCK = threading.Lock()
+TAB_COMMANDS = {}  # tab_id -> [{"id": str, "action": str, ...}]
 CACHE_LOCK = threading.Lock()
+AUTO_FOCUS_CLAUDE = True
+X11_FOCUS_LOCK = threading.Lock()
+LAST_X11_FOCUS = {"role": None, "ts": 0.0}
+
+
+def focus_claude_pane(role="worker", wait=False, force=False):
+    """Focus the Claude Chrome window/split-pane on DISPLAY so ProseMirror accepts input."""
+    if not AUTO_FOCUS_CLAUDE or not os.environ.get("DISPLAY"):
+        return False
+    now = time.time()
+    if not force and LAST_X11_FOCUS["role"] == role and (now - LAST_X11_FOCUS["ts"]) < 2.5:
+        return True
+    def _do():
+        with X11_FOCUS_LOCK:
+            try:
+                now_in = time.time()
+                if not force and LAST_X11_FOCUS["role"] == role and (now_in - LAST_X11_FOCUS["ts"]) < 2.5:
+                    return
+                LAST_X11_FOCUS["role"] = role
+                LAST_X11_FOCUS["ts"] = now_in
+                import ctypes
+                x11 = ctypes.cdll.LoadLibrary("libX11.so.6")
+                xtst = ctypes.cdll.LoadLibrary("libXtst.so.6")
+                class XWinAttr(ctypes.Structure):
+                    _fields_ = [
+                        ("x", ctypes.c_int), ("y", ctypes.c_int),
+                        ("width", ctypes.c_int), ("height", ctypes.c_int),
+                        ("border_width", ctypes.c_int), ("depth", ctypes.c_int),
+                        ("visual", ctypes.c_void_p), ("root", ctypes.c_ulong),
+                        ("c_class", ctypes.c_int), ("bit_gravity", ctypes.c_int),
+                        ("win_gravity", ctypes.c_int), ("backing_store", ctypes.c_int),
+                        ("backing_planes", ctypes.c_ulong), ("backing_pixel", ctypes.c_ulong),
+                        ("save_under", ctypes.c_int), ("colormap", ctypes.c_ulong),
+                        ("map_installed", ctypes.c_int), ("map_state", ctypes.c_int),
+                        ("all_event_masks", ctypes.c_long), ("your_event_mask", ctypes.c_long),
+                        ("do_not_propagate_mask", ctypes.c_long), ("override_redirect", ctypes.c_int),
+                        ("screen", ctypes.c_void_p),
+                    ]
+                class XClientMsg(ctypes.Structure):
+                    _fields_ = [
+                        ("type", ctypes.c_int), ("serial", ctypes.c_ulong), ("send_event", ctypes.c_int),
+                        ("display", ctypes.c_void_p), ("window", ctypes.c_ulong), ("message_type", ctypes.c_ulong),
+                        ("format", ctypes.c_int), ("data", ctypes.c_long * 5),
+                    ]
+                x11.XOpenDisplay.argtypes = [ctypes.c_char_p]
+                x11.XOpenDisplay.restype = ctypes.c_void_p
+                x11.XCloseDisplay.argtypes = [ctypes.c_void_p]
+                x11.XDefaultRootWindow.argtypes = [ctypes.c_void_p]
+                x11.XDefaultRootWindow.restype = ctypes.c_ulong
+                x11.XInternAtom.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int]
+                x11.XInternAtom.restype = ctypes.c_ulong
+                x11.XGetWindowProperty.argtypes = [
+                    ctypes.c_void_p, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_long, ctypes.c_long,
+                    ctypes.c_int, ctypes.c_ulong, ctypes.POINTER(ctypes.c_ulong),
+                    ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_ulong),
+                    ctypes.POINTER(ctypes.c_ulong), ctypes.POINTER(ctypes.c_void_p),
+                ]
+                x11.XGetWindowProperty.restype = ctypes.c_int
+                x11.XFree.argtypes = [ctypes.c_void_p]
+                x11.XGetWindowAttributes.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.POINTER(XWinAttr)]
+                x11.XGetWindowAttributes.restype = ctypes.c_int
+                x11.XTranslateCoordinates.argtypes = [
+                    ctypes.c_void_p, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_int, ctypes.c_int,
+                    ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_ulong),
+                ]
+                x11.XSendEvent.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_int, ctypes.c_long, ctypes.c_void_p]
+                x11.XSync.argtypes = [ctypes.c_void_p, ctypes.c_int]
+                xtst.XTestFakeMotionEvent.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_ulong]
+                xtst.XTestFakeButtonEvent.argtypes = [ctypes.c_void_p, ctypes.c_uint, ctypes.c_int, ctypes.c_ulong]
+
+                dpy = x11.XOpenDisplay(None)
+                if not dpy:
+                    return
+                try:
+                    root = x11.XDefaultRootWindow(dpy)
+                    a_list = x11.XInternAtom(dpy, b"_NET_CLIENT_LIST", 0)
+                    a_name = x11.XInternAtom(dpy, b"_NET_WM_NAME", 0)
+                    a_utf8 = x11.XInternAtom(dpy, b"UTF8_STRING", 0)
+                    a_act = x11.XInternAtom(dpy, b"_NET_ACTIVE_WINDOW", 0)
+
+                    def prop(w, atom, rtype=0):
+                        at, af, ni, ba = ctypes.c_ulong(), ctypes.c_int(), ctypes.c_ulong(), ctypes.c_ulong()
+                        p = ctypes.c_void_p()
+                        rc = x11.XGetWindowProperty(dpy, w, atom, 0, 1024, 0, rtype, ctypes.byref(at), ctypes.byref(af), ctypes.byref(ni), ctypes.byref(ba), ctypes.byref(p))
+                        if rc != 0 or not p.value:
+                            return None
+                        try:
+                            if af.value == 32:
+                                return list((ctypes.c_ulong * ni.value).from_address(p.value))
+                            if af.value == 8:
+                                return ctypes.string_at(p.value, ni.value).decode("utf-8", errors="replace")
+                        finally:
+                            x11.XFree(p)
+                        return None
+
+                    wins = prop(root, a_list, 33) or []
+                    claude_wins = []
+                    for w in wins:
+                        t = prop(w, a_name, a_utf8) or ""
+                        if "claude" in t.lower() and "chrome" in t.lower():
+                            claude_wins.append(w)
+                    if not claude_wins:
+                        return
+                    target_w = claude_wins[1] if (role == "reviewer" and len(claude_wins) >= 2) else claude_wins[0]
+                    ev = XClientMsg(type=33, display=dpy, window=target_w, message_type=a_act, format=32)
+                    ev.data[0] = 2
+                    x11.XSendEvent(dpy, root, 0, (1 << 19) | (1 << 20), ctypes.byref(ev))
+                    x11.XSync(dpy, 0)
+                    time.sleep(0.18)
+
+                    attr = XWinAttr()
+                    x11.XGetWindowAttributes(dpy, target_w, ctypes.byref(attr))
+                    # Click blank side-margin inside split pane (away from composer & scroll button)
+                    rx = int(attr.width * (0.92 if (role == "reviewer" and len(claude_wins) == 1) else (0.5 if len(claude_wins) >= 2 else 0.08)))
+                    ry = int(attr.height * 0.50)
+                    gx, gy, ch = ctypes.c_int(), ctypes.c_int(), ctypes.c_ulong()
+                    x11.XTranslateCoordinates(dpy, target_w, root, rx, ry, ctypes.byref(gx), ctypes.byref(gy), ctypes.byref(ch))
+                    xtst.XTestFakeMotionEvent(dpy, -1, gx.value, gy.value, 0)
+                    x11.XSync(dpy, 0)
+                    time.sleep(0.03)
+                    xtst.XTestFakeButtonEvent(dpy, 1, 1, 0)
+                    x11.XSync(dpy, 0)
+                    time.sleep(0.03)
+                    xtst.XTestFakeButtonEvent(dpy, 1, 0, 0)
+                    x11.XSync(dpy, 0)
+                finally:
+                    x11.XCloseDisplay(dpy)
+            except Exception as exc:
+                print(f"[AUTO-FOCUS] Fehler: {exc}")
+    if wait:
+        _do()
+        time.sleep(0.12)
+    else:
+        threading.Thread(target=_do, daemon=True).start()
+    return True
 RESPONSE_CACHE = {}  # sha256 -> {"ts": float, "content": str}
 CACHE_TTL_SEC = 300
+
+PROVIDER_SLOTS = {
+    p: {
+        "lock": threading.Lock(),
+        "done_event": threading.Event(),
+        "pending_mission": None,
+        "final_result": "",
+        "error": "",
+        "active_task": "",
+        "started_at": "",
+        "mission_started_ts": 0.0,
+        "mission_source": "dashboard",
+        "browser_model": "",
+        "desired_model": "",
+        "initialized": False,
+        "last_activity_ts": 0.0,
+    }
+    for p in ("gemini", "claude")
+}
+
+DEFAULT_INIT_SOUL = (
+    "Session-Konfiguration für diese gesamte Unterhaltung (Anbindung an mein lokales Automatisierungs-Skript):\n"
+    "Bitte halte dich in allen Antworten dieser Sitzung strikt an folgende Regeln:\n"
+    "1. Antworte direkt, präzise und technisch ohne Einleitungsfloskeln.\n"
+    "2. Erfinde niemals Dateipfade, Hostnamen, Ports, Dienste oder Messwerte. Wenn lokale Systemdaten fehlen und noch kein [Tool-Ergebnis] vorliegt, rufe stattdessen ein Tool auf.\n"
+    "3. WICHTIG (KEINE EIGENE SANDBOX NUTZEN!): Nutze NIEMALS dein eingebautes Cloud/Sandbox-Bash-Tool — das läuft nicht auf 'Remote-Host'. Wenn dir im Prompt '[Verfügbare Hermes-Tools (auf Server 'Remote-Host')]' angeboten werden, antworte stattdessen AUSSCHLIESSLICH mit genau einem JSON-Block ohne weiteren Text:\n"
+    '```json\n{"tool_call": {"name": "TOOL_NAME", "arguments": {"param": "wert"}}}\n```\n'
+    "4. Wenn kein Tool nötig ist oder das [Tool-Ergebnis] bereits vorliegt, antworte direkt als sauberes Markdown.\n\n"
+    "Bitte bestätige diese Regeln jetzt nur mit dem Wort: READY"
+)
+
+
+def run_provider_init(provider, soul_prompt="", timeout=60):
+    prov = (provider or "gemini").strip().lower()
+    slot = get_provider_slot(prov)
+    prompt = (soul_prompt or "").strip() or DEFAULT_INIT_SOUL
+
+    tabs_now = cleanup_and_get_tabs()
+    provider_tabs = [t for t in tabs_now.values() if t.get("provider", "gemini") == prov]
+    if not any(t.get("role") in ("worker", "coder", "solo") for t in provider_tabs):
+        return False, f"Kein aktiver {prov} Worker/Solo-Tab im Browser."
+
+    with slot["lock"]:
+        if prov == "claude":
+            focus_claude_pane("worker", wait=True, force=True)
+        mission_id = str(f"init_{int(time.time() * 1000)}")
+        slot["done_event"].clear()
+        slot["final_result"] = ""
+        slot["pending_mission"] = {
+            "id": mission_id,
+            "type": "init",
+            "provider": prov,
+            "task": prompt,
+            "rounds": 1,
+            "execute": False,
+            "status": "pending",
+        }
+        print(f"[\033[96mINIT\033[0m] ({prov}) Starte neuen Chat + Soul-Bootstrap...")
+        ok = slot["done_event"].wait(timeout=timeout)
+        res = slot.get("final_result", "")
+        if ok:
+            slot["initialized"] = True
+            with CACHE_LOCK:
+                to_del = [k for k in RESPONSE_CACHE if True]
+                for k in to_del:
+                    RESPONSE_CACHE.pop(k, None)
+            return True, res or "READY"
+        slot["pending_mission"] = None
+        return False, f"Init-Timeout ({timeout}s) für {prov}"
+
+
+def get_provider_slot(provider):
+    p = (provider or "gemini").strip().lower()
+    return PROVIDER_SLOTS.get(p, PROVIDER_SLOTS["gemini"])
 
 
 def cleanup_and_get_tabs():
@@ -57,31 +267,83 @@ def cleanup_and_get_tabs():
         return dict(ACTIVE_TABS)
 
 
-def register_tab(tab_id, requested_role=""):
+def register_tab(tab_id, requested_role="", provider="gemini"):
     now_ts = time.time()
+    prov = (provider or "gemini").strip().lower() or "gemini"
     with TABS_LOCK:
         stale = [tid for tid, info in ACTIVE_TABS.items() if now_ts - info.get("last_seen", 0) > 20]
         for tid in stale:
             del ACTIVE_TABS[tid]
 
         if requested_role:
-            ACTIVE_TABS[tab_id] = {"role": requested_role, "last_seen": now_ts}
+            ACTIVE_TABS[tab_id] = {"role": requested_role, "provider": prov, "last_seen": now_ts}
             return requested_role
 
         if tab_id in ACTIVE_TABS and ACTIVE_TABS[tab_id].get("role"):
             ACTIVE_TABS[tab_id]["last_seen"] = now_ts
+            ACTIVE_TABS[tab_id]["provider"] = prov
             return ACTIVE_TABS[tab_id]["role"]
 
-        roles = [info.get("role") for info in ACTIVE_TABS.values()]
+        roles = [info.get("role") for info in ACTIVE_TABS.values() if info.get("provider", "gemini") == prov]
         if "worker" not in roles and "coder" not in roles:
             assigned = "worker"
-        elif "image" not in roles:
+        elif "image" not in roles and prov == "gemini":
             assigned = "image"
         else:
             assigned = "solo"
 
-        ACTIVE_TABS[tab_id] = {"role": assigned, "last_seen": now_ts}
+        ACTIVE_TABS[tab_id] = {"role": assigned, "provider": prov, "last_seen": now_ts}
         return assigned
+
+
+def queue_tab_command(action, provider="all", role="all", tab_id="", value=""):
+    """Queue a remote control command for matching active browser tabs."""
+    act = (action or "").strip().lower()
+    prov_f = (provider or "all").strip().lower()
+    role_f = (role or "all").strip().lower()
+    tid_f = (tab_id or "").strip()
+    tabs = cleanup_and_get_tabs()
+    targets = []
+    for tid, info in tabs.items():
+        if tid_f and tid != tid_f:
+            continue
+        if prov_f not in ("", "all") and (info.get("provider") or "gemini").lower() != prov_f:
+            continue
+        if role_f not in ("", "all") and (info.get("role") or "").lower() != role_f:
+            continue
+        targets.append(tid)
+    cmd_id = f"cmd_{int(time.time() * 1000)}_{act}"
+    cmd = {
+        "id": cmd_id,
+        "action": act,
+        "value": value,
+        "ts": time.time(),
+    }
+    with TAB_COMMANDS_LOCK:
+        for tid in targets:
+            q = TAB_COMMANDS.setdefault(tid, [])
+            q.append(dict(cmd))
+            # Keep queue bounded and fresh
+            TAB_COMMANDS[tid] = [c for c in q if time.time() - c.get("ts", 0) < 60][-10:]
+    if act in ("reload", "new_chat"):
+        abort_provs = ("gemini", "claude") if prov_f in ("", "all") else (prov_f,)
+        for ap in abort_provs:
+            if ap in PROVIDER_SLOTS:
+                sl = PROVIDER_SLOTS[ap]
+                sl["pending_mission"] = None
+                if not sl["done_event"].is_set():
+                    sl["error"] = f"Aborted by remote {act}"
+                    sl["done_event"].set()
+    return targets, cmd
+
+
+def pop_tab_commands(tab_id):
+    if not tab_id:
+        return []
+    now = time.time()
+    with TAB_COMMANDS_LOCK:
+        cmds = TAB_COMMANDS.pop(tab_id, [])
+    return [c for c in cmds if now - c.get("ts", 0) < 60]
 
 # In-Memory Event Store
 DEBATE_STATE = {
@@ -675,6 +937,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         <div class="mission-input-row">
             <input type="text" id="mission-text" placeholder="Z. B.: Ich möchte eine Übersicht meines Systems (RAM, CPU, Festplatten, NVidia-GPU)..." autofocus>
             <button class="btn-launch" id="btn-submit" onclick="submitMission()">▶️ Mission starten</button>
+            <button class="btn-launch" style="background:#1e293b;border:1px solid #334155;" onclick="initProvider('gemini')">🔄 Init Gemini</button>
+            <button class="btn-launch" style="background:#1e293b;border:1px solid #334155;" onclick="initProvider('claude')">🔄 Init Claude</button>
         </div>
         <div class="mission-options">
             <label style="display: flex; align-items: center; gap: 6px; cursor: pointer;">
@@ -848,6 +1112,20 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                 renderEvents(events);
             } catch (e) {
                 console.error(e);
+            }
+        }
+
+        async function initProvider(prov) {
+            try {
+                const res = await fetch('/init', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ provider: prov })
+                });
+                const data = await res.json();
+                alert('Init ' + prov + ': ' + JSON.stringify(data.results || data));
+            } catch (e) {
+                alert('Init Fehler: ' + e);
             }
         }
 
@@ -1038,7 +1316,35 @@ class GeminiBridgeHandler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _extract_tool_calls(self, res_content, tool_names):
+        """Extract one or more valid {"tool_call": {"name": ..., "arguments": ...}} objects."""
+        if not tool_names or "tool_call" not in (res_content or ""):
+            return []
+        decoder = json.JSONDecoder()
+        results = []
+        idx = 0
+        length = len(res_content)
+        while idx < length:
+            brace_idx = res_content.find("{", idx)
+            if brace_idx == -1:
+                break
+            try:
+                obj, end_idx = decoder.raw_decode(res_content, brace_idx)
+                idx = end_idx
+                if isinstance(obj, dict) and "tool_call" in obj:
+                    tc_obj = obj.get("tool_call") or {}
+                    tc_name = tc_obj.get("name", "")
+                    tc_args = tc_obj.get("arguments", {})
+                    if tc_name in tool_names and isinstance(tc_args, dict):
+                        results.append((tc_name, tc_args))
+            except Exception:
+                idx = brace_idx + 1
+        return results
+
     def _send_openai_completion(self, completion_id, model, is_stream, res_content, prompt_tokens, completion_tokens, tool_call=None):
+        tool_calls_list = []
+        if tool_call:
+            tool_calls_list = tool_call if isinstance(tool_call, list) else [tool_call]
         if is_stream:
             self.send_response(200)
             self._send_cors_headers()
@@ -1046,15 +1352,18 @@ class GeminiBridgeHandler(http.server.BaseHTTPRequestHandler):
             self.send_header("Cache-Control", "no-cache")
             self.send_header("Connection", "keep-alive")
             self.end_headers()
-            if tool_call:
-                t_name, t_args = tool_call
-                args_str = json.dumps(t_args, ensure_ascii=False)
-                call_id = f"call_{int(time.time() * 1000)}"
-                chunks = [
-                    ({"role": "assistant", "tool_calls": [{"index": 0, "id": call_id, "type": "function", "function": {"name": t_name, "arguments": ""}}]}, None),
-                    ({"tool_calls": [{"index": 0, "function": {"arguments": args_str}}]}, None),
-                    ({}, "tool_calls"),
-                ]
+            if tool_calls_list:
+                base_ts = int(time.time() * 1000)
+                chunks = []
+                for idx, (t_name, t_args) in enumerate(tool_calls_list):
+                    args_str = json.dumps(t_args, ensure_ascii=False)
+                    call_id = f"call_{base_ts}_{idx}"
+                    delta_start = {"tool_calls": [{"index": idx, "id": call_id, "type": "function", "function": {"name": t_name, "arguments": ""}}]}
+                    if idx == 0:
+                        delta_start["role"] = "assistant"
+                    chunks.append((delta_start, None))
+                    chunks.append(({"tool_calls": [{"index": idx, "function": {"arguments": args_str}}]}, None))
+                chunks.append(({}, "tool_calls"))
             else:
                 chunks = [({"role": "assistant"}, None), ({"content": res_content}, None), ({}, "stop")]
             for delta, reason in chunks:
@@ -1069,18 +1378,18 @@ class GeminiBridgeHandler(http.server.BaseHTTPRequestHandler):
             self.wfile.write(b"data: [DONE]\n\n")
             self.wfile.flush()
         else:
-            if tool_call:
-                t_name, t_args = tool_call
-                call_id = f"call_{int(time.time() * 1000)}"
+            if tool_calls_list:
+                base_ts = int(time.time() * 1000)
                 msg_obj = {
                     "role": "assistant",
                     "content": None,
                     "tool_calls": [
                         {
-                            "id": call_id,
+                            "id": f"call_{base_ts}_{idx}",
                             "type": "function",
                             "function": {"name": t_name, "arguments": json.dumps(t_args, ensure_ascii=False)}
                         }
+                        for idx, (t_name, t_args) in enumerate(tool_calls_list)
                     ]
                 }
                 f_reason = "tool_calls"
@@ -1125,12 +1434,13 @@ class GeminiBridgeHandler(http.server.BaseHTTPRequestHandler):
         elif path == "/register_tab":
             tab_id = (qs.get("tab_id") or [""])[0].strip()
             req_role = (qs.get("role") or [""])[0].strip()
+            tab_provider = (qs.get("provider") or ["gemini"])[0].strip().lower() or "gemini"
             if not tab_id:
                 self._send_json(400, {"error": "tab_id required"})
                 return
-            assigned = register_tab(tab_id, req_role)
-            print(f"[\033[96mTAB-AUTO\033[0m] Tab {tab_id[:8]} -> Rolle '{assigned}'")
-            self._send_json(200, {"assigned_role": assigned, "active_tabs": cleanup_and_get_tabs()})
+            assigned = register_tab(tab_id, req_role, tab_provider)
+            print(f"[\033[96mTAB-AUTO\033[0m] ({tab_provider}) Tab {tab_id[:8]} -> Rolle '{assigned}'")
+            self._send_json(200, {"assigned_role": assigned, "provider": tab_provider, "active_tabs": cleanup_and_get_tabs()})
 
         elif path in ["/v1/models", "/models"]:
             self._send_json(200, {
@@ -1140,41 +1450,95 @@ class GeminiBridgeHandler(http.server.BaseHTTPRequestHandler):
                         "id": "gemini-browser",
                         "object": "model",
                         "created": 1700000000,
-                        "owned_by": "gemini-tandem"
+                        "owned_by": "llm-web-bridge"
+                    },
+                    {
+                        "id": "claude-browser",
+                        "object": "model",
+                        "created": 1700000000,
+                        "owned_by": "llm-web-bridge"
                     }
                 ]
             })
 
+        elif path == "/heartbeat":
+            tab_id = (qs.get("tab_id") or [""])[0].strip()
+            tab_role = (qs.get("role") or [""])[0].strip()
+            tab_provider = (qs.get("provider") or ["gemini"])[0].strip().lower() or "gemini"
+            if tab_id and tab_role:
+                register_tab(tab_id, tab_role, tab_provider)
+            generating = (qs.get("generating") or ["0"])[0] == "1"
+            if generating:
+                get_provider_slot(tab_provider)["last_activity_ts"] = time.time()
+            self._send_json(200, {"status": "ok", "commands": pop_tab_commands(tab_id)})
+
+        elif path == "/tabs":
+            self._send_json(200, {"active_tabs": cleanup_and_get_tabs()})
+
+        elif path == "/userscript/gemini-dual-agent.user.js":
+            us_path = os.path.join(DOWNLOADS_DIR, "gemini-dual-agent.user.js")
+            if not os.path.isfile(us_path):
+                self._send_json(404, {"error": "Userscript not found", "path": us_path})
+                return
+            with open(us_path, "rb") as f:
+                us_bytes = f.read()
+            self.send_response(200)
+            self._send_cors_headers()
+            self.send_header("Content-Type", "application/javascript; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(us_bytes)))
+            self.end_headers()
+            self.wfile.write(us_bytes)
+
+        elif path == "/control/reload":
+            prov = (qs.get("provider") or ["all"])[0]
+            role = (qs.get("role") or ["all"])[0]
+            tid = (qs.get("tab_id") or [""])[0]
+            targets, cmd = queue_tab_command("reload", provider=prov, role=role, tab_id=tid)
+            print(f"[\033[96mCONTROL\033[0m] Reload-Kommando eingereiht für {len(targets)} Tab(s) (provider={prov}, role={role})")
+            self._send_json(200, {"success": True, "targets": targets, "command": cmd})
+
         elif path == "/pending_mission":
             tab_id = (qs.get("tab_id") or [""])[0].strip()
             tab_role = (qs.get("role") or [""])[0].strip()
+            tab_provider = (qs.get("provider") or ["gemini"])[0].strip().lower() or "gemini"
             if tab_id and tab_role:
-                register_tab(tab_id, tab_role)
+                register_tab(tab_id, tab_role, tab_provider)
             cooldowns = get_active_cooldowns()
             DEBATE_STATE["model_cooldowns"] = cooldowns
-            if not DEBATE_STATE.get("desired_model") and not DEBATE_STATE.get("pending_mission"):
+            slot = get_provider_slot(tab_provider)
+            generating = (qs.get("generating") or ["0"])[0] == "1"
+            if generating:
+                slot["last_activity_ts"] = time.time()
+            if tab_provider == "gemini" and not DEBATE_STATE.get("desired_model") and not slot.get("pending_mission"):
                 cur_m = (DEBATE_STATE.get("browser_model") or "").lower()
                 for m_name, c in cooldowns.items():
-                    if c.get("expired") and m_name.lower() not in cur_m:
+                    if c.get("provider", "gemini") == "gemini" and c.get("expired") and m_name.lower() not in cur_m:
                         DEBATE_STATE["desired_model"] = m_name
-                        # Bei Fehlschlag 10 Min warten bis zum nächsten Versuch
-                        set_model_cooldown(c.get("provider", "gemini"), m_name, time.time() + 600, "", "Auto-Recovery-Probe läuft")
+                        set_model_cooldown("gemini", m_name, time.time() + 600, "", "Auto-Recovery-Probe läuft")
                         print(f"[\033[96mAUTO-RECOVERY\033[0m] Cooldown für '{m_name}' abgelaufen – versuche Rückwechsel im Browser...")
                         break
-            mission = DEBATE_STATE.get("pending_mission")
-            active_roles = [info.get("role") for info in cleanup_and_get_tabs().values()]
+            mission = slot.get("pending_mission")
+            # Fallback für Dashboard-Tasks ohne expliziten Provider (Standard: gemini)
+            if mission is None and tab_provider == "gemini" and DEBATE_STATE.get("pending_mission"):
+                if (DEBATE_STATE["pending_mission"].get("provider") or "gemini") == "gemini":
+                    mission = DEBATE_STATE["pending_mission"]
+            all_tabs = cleanup_and_get_tabs()
+            provider_roles = [info.get("role") for info in all_tabs.values() if info.get("provider", "gemini") == tab_provider]
             # Capability-Filter: Bild-Tab nimmt nur Bild-Aufträge; Worker übernimmt Bild nur wenn kein Bild-Tab aktiv ist
             if mission and tab_role:
                 m_cap = mission.get("capability", "chat")
                 if tab_role == "image" and m_cap != "image":
                     mission = None
-                elif tab_role in ("worker", "coder") and m_cap == "image" and "image" in active_roles:
+                elif tab_role in ("worker", "coder") and m_cap == "image" and "image" in provider_roles:
                     mission = None
             self._send_json(200, {
                 "mission": mission,
-                "desired_model": DEBATE_STATE.get("desired_model", ""),
+                "provider": tab_provider,
+                "desired_model": DEBATE_STATE.get("desired_model", "") if tab_provider == "gemini" else "",
                 "model_cooldowns": cooldowns,
-                "has_reviewer": "reviewer" in active_roles
+                "has_reviewer": "reviewer" in provider_roles,
+                "commands": pop_tab_commands(tab_id),
             })
 
         elif path.startswith("/images/"):
@@ -1282,22 +1646,48 @@ class GeminiBridgeHandler(http.server.BaseHTTPRequestHandler):
             tools_hint = ""
             if tool_sigs:
                 tools_hint = (
-                    "\n[Verfügbare Tools]:\n"
+                    "\n[Verfügbare Hermes-Tools (auf Server 'Remote-Host')]:\n"
                     + "\n".join(tool_sigs)
                     + '\nWenn du zur Beantwortung ein Tool ausführen musst, antworte AUSSCHLIESSLICH mit genau einem JSON-Block ohne weiteren Text:\n'
                     '```json\n{"tool_call": {"name": "TOOL_NAME", "arguments": {"param": "wert"}}}\n```\n'
                     "Wenn du kein Tool brauchst oder schon das Tool-Ergebnis vorliegt, antworte normal als Text."
                 )
 
-            # Configurable system context (override via BRIDGE_SYSTEM_PROMPT env var)
-            default_sys = (
-                "[System-Kontext: Du bist ein technischer Assistent über die lokale Browser-Bridge. "
-                "Antworte direkt, praxisnah und ohne Standard-Floskeln wie 'Als Cloud-KI kann ich nicht...'. "
-                "ERFINDE NIEMALS Dateipfade, Skripte oder Messwerte! Wenn lokale System-/Netzwerkdaten fehlen und noch kein [Tool-Ergebnis] vorliegt, rufe zwingend ein Tool auf.]"
-            )
-            sys_ctx = os.getenv("BRIDGE_SYSTEM_PROMPT", default_sys)
-            task_prompt = f"{sys_ctx}{tools_hint}\n\n{effective_input}"
-            cache_key = hashlib.sha256(effective_input.encode("utf-8")).hexdigest()
+            target_provider = "claude" if "claude" in str(model).lower() else "gemini"
+            slot = get_provider_slot(target_provider)
+
+            # Direktes /init Kommando über Chat-API (startet neuen Chat + Soul-Bootstrap)
+            if raw_user_msg.strip().lower().startswith("/init"):
+                custom_soul = raw_user_msg.strip()[5:].strip()
+                ok, init_res = run_provider_init(target_provider, custom_soul, timeout=min(int(timeout), 60))
+                if ok:
+                    self._send_openai_completion(
+                        f"chatcmpl-{target_provider}-init-{int(time.time() * 1000)}",
+                        model,
+                        is_stream,
+                        f"✅ {target_provider.capitalize()} wurde im neuen Chat mit API-Harness-Soul initialisiert ({init_res[:60]}).",
+                        estimate_tokens(raw_user_msg),
+                        24,
+                    )
+                else:
+                    self._send_json(503, {"error": {"message": init_res, "type": "init_failed", "code": 503}})
+                return
+
+            if slot.get("initialized"):
+                # Nach /init reicht der schlanke Tool-Hinweis + User-Anfrage
+                task_prompt = f"{tools_hint}\n\n{effective_input}".strip()
+            else:
+                # Fallback für nicht-initialisierte Tabs
+                task_prompt = (
+                    "[System-Kontext: Du bist Assistant, the user's technischer Assistent über die lokale Hermes-Bridge "
+                    "(Laptop 'Local-Workstation' 127.0.0.1, Linux; Hermes-Server 'Remote-Host' 127.0.0.1). "
+                    "Antworte direkt, praxisnah und ohne Standard-Floskeln wie 'Als Cloud-KI kann ich nicht...'. "
+                    "WICHTIG: Nutze NICHT dein eigenes Web-Sandbox-Bash-Tool (das hat keinen Zugriff auf Remote-Host), "
+                    "sondern rufe bei Bedarf die unten stehenden Hermes-Tools via JSON tool_call auf — mein Bridge-Skript führt sie direkt auf Remote-Host aus! "
+                    "ERFINDE NIEMALS Dateipfade, Skripte oder Messwerte! Wenn lokale System-/Netzwerkdaten fehlen und noch kein [Tool-Ergebnis] vorliegt, rufe zwingend ein Hermes-Tool auf.]"
+                    f"{tools_hint}\n\n{effective_input}"
+                )
+            cache_key = hashlib.sha256((target_provider + "::" + effective_input).encode("utf-8")).hexdigest()
 
             # 0. Cache-Hit prüfen (nur für normale User-Anfragen, nicht bei Tool-Loops)
             if use_cache:
@@ -1305,9 +1695,9 @@ class GeminiBridgeHandler(http.server.BaseHTTPRequestHandler):
                     cached = RESPONSE_CACHE.get(cache_key)
                     if cached and (time.time() - cached["ts"] < CACHE_TTL_SEC):
                         res_content = cached["content"]
-                        print(f"[\033[96mCACHE-HIT\033[0m] Identischer Prompt aus Cache bedient ({len(res_content)} Zeichen)")
+                        print(f"[\033[96mCACHE-HIT\033[0m] ({target_provider}) Identischer Prompt aus Cache bedient ({len(res_content)} Zeichen)")
                         self._send_openai_completion(
-                            f"chatcmpl-gemini-cache-{int(time.time() * 1000)}",
+                            f"chatcmpl-{target_provider}-cache-{int(time.time() * 1000)}",
                             model,
                             is_stream,
                             res_content,
@@ -1316,77 +1706,90 @@ class GeminiBridgeHandler(http.server.BaseHTTPRequestHandler):
                         )
                         return
 
-            # Schneller Check: Falls Tabs verbunden sind, aber kein Worker aktiv ist, nicht 180s aufstauen
+            # Schneller Check: Pro Provider prüfen, ob ein aktiver Worker-Tab existiert
             tabs_now = cleanup_and_get_tabs()
-            if tabs_now and not any(t.get("role") in ("worker", "coder") for t in tabs_now.values()):
+            provider_tabs = [t for t in tabs_now.values() if t.get("provider", "gemini") == target_provider]
+            if not any(t.get("role") in ("worker", "coder") for t in provider_tabs):
                 self._send_json(503, {
                     "error": {
-                        "message": "Kein aktiver Gemini Worker-Tab im Browser (aktuell nur: " + ", ".join(t.get("role", "?") for t in tabs_now.values()) + "). Bitte Tab auf Worker stellen.",
+                        "message": f"Kein aktiver {target_provider.capitalize()} Worker-Tab im Browser.",
                         "type": "no_worker_tab",
                         "code": 503
                     }
                 })
                 return
 
-            # Strikte Serialisierung: Falls parallele Requests kommen, warten sie in der Queue
-            with MISSION_LOCK:
+            # Strikte Serialisierung pro Provider (Gemini und Claude laufen unabhängig parallel!)
+            with slot["lock"]:
+                if target_provider == "claude":
+                    focus_claude_pane("worker", wait=True, force=True)
                 mission_id = str(int(time.time() * 1000))
-                MISSION_COMPLETED_EVENT.clear()
-                DEBATE_STATE["active_task"] = task_prompt
-                DEBATE_STATE["started_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                DEBATE_STATE["mission_source"] = "litellm"
-                DEBATE_STATE["mission_started_ts"] = time.time()
-                DEBATE_STATE["final_result"] = ""
-                DEBATE_STATE["pending_mission"] = {
+                slot["done_event"].clear()
+                slot["active_task"] = task_prompt
+                slot["started_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                slot["mission_source"] = "litellm"
+                slot["mission_started_ts"] = time.time()
+                slot["last_activity_ts"] = slot["mission_started_ts"]
+                slot["final_result"] = ""
+                slot["error"] = ""
+                slot["pending_mission"] = {
                     "id": mission_id,
+                    "provider": target_provider,
                     "task": task_prompt,
                     "rounds": 1,
                     "execute": execute,
                     "status": "pending"
                 }
 
-                print(f"\n[\033[93mLITELLM / HERMES\033[0m] OpenAI-Anfrage empfangen (Modell: {model}, Stream: {is_stream}): {raw_user_msg[:80]}...")
+                DEBATE_STATE["active_task"] = task_prompt
+                DEBATE_STATE["started_at"] = slot["started_at"]
+                DEBATE_STATE["mission_source"] = "litellm"
+                DEBATE_STATE["mission_started_ts"] = slot["mission_started_ts"]
+                DEBATE_STATE["final_result"] = ""
+                DEBATE_STATE["pending_mission"] = slot["pending_mission"]
 
-                # Warten bis Gemini die Mission beendet hat
+                print(f"\n[\033[93mLITELLM / HERMES\033[0m] ({target_provider}) OpenAI-Anfrage empfangen (Modell: {model}, Stream: {is_stream}): {raw_user_msg[:80]}...")
+
+                # Aktivitätsbasiertes Warten: Solange Worker oder Reviewer im Browser aktiv sind, läuft die Mission weiter.
+                inactivity_timeout = min(int(timeout), 90)
+                max_total_timeout = max(int(timeout) + 30, 210)
                 start_wait = time.time()
-                finished = MISSION_COMPLETED_EVENT.wait(timeout=timeout)
+                finished = False
+                idle_for = 0.0
+                total_for = 0.0
+                while True:
+                    if slot["done_event"].wait(timeout=5.0):
+                        finished = True
+                        break
+                    now = time.time()
+                    idle_for = now - slot.get("last_activity_ts", start_wait)
+                    total_for = now - start_wait
+                    if idle_for >= inactivity_timeout or total_for >= max_total_timeout:
+                        break
 
-                if finished and DEBATE_STATE.get("final_result"):
-                    res_content = DEBATE_STATE["final_result"]
+                if finished and slot.get("final_result"):
+                    res_content = slot["final_result"]
                     elapsed_ms = int((time.time() - start_wait) * 1000)
                     duration = round(elapsed_ms / 1000.0, 1)
-                    print(f"[\033[92mFERTIG AN LITELLM\033[0m] Gemini Tandem liefert Antwort ({duration}s)")
+                    print(f"[\033[92mFERTIG AN LITELLM\033[0m] ({target_provider}) liefert Antwort ({duration}s)")
                     prompt_tokens = estimate_tokens(task_prompt)
                     completion_tokens = estimate_tokens(res_content)
 
-                    # Prüfe ob Gemini einen tool_call im JSON-Format zurückgegeben hat
-                    parsed_tc = None
-                    if tool_names and "tool_call" in res_content:
-                        start_idx = res_content.find("{")
-                        end_idx = res_content.rfind("}")
-                        if start_idx != -1 and end_idx > start_idx:
-                            cand_str = res_content[start_idx:end_idx + 1]
-                            try:
-                                obj = json.loads(cand_str)
-                                tc_obj = obj.get("tool_call") or {}
-                                tc_name = tc_obj.get("name", "")
-                                tc_args = tc_obj.get("arguments", {})
-                                if tc_name in tool_names and isinstance(tc_args, dict):
-                                    parsed_tc = (tc_name, tc_args)
-                                    print(f"[\033[95mTOOL-CALL\033[0m] Gemini ruft Hermes-Tool '{tc_name}' auf: {tc_args}")
-                            except Exception:
-                                pass
+                    # Prüfe ob das Modell einen oder mehrere tool_calls im JSON-Format zurückgegeben hat
+                    parsed_tcs = self._extract_tool_calls(res_content, tool_names)
+                    for tc_name, tc_args in parsed_tcs:
+                        print(f"[\033[95mTOOL-CALL\033[0m] ({target_provider}) ruft Hermes-Tool '{tc_name}' auf: {tc_args}")
 
-                    if use_cache and not parsed_tc:
+                    if use_cache and not parsed_tcs and not res_content.lstrip().startswith(("ERROR:", "Fehler:")):
                         with CACHE_LOCK:
                             RESPONSE_CACHE[cache_key] = {"ts": time.time(), "content": res_content}
                             if len(RESPONSE_CACHE) > 50:
                                 oldest = min(RESPONSE_CACHE.items(), key=lambda kv: kv[1]["ts"])[0]
                                 del RESPONSE_CACHE[oldest]
                     record_model_run(
-                        provider=DEBATE_STATE.get("browser_provider", "gemini"),
-                        model=DEBATE_STATE.get("browser_model") or model,
-                        capability=DEBATE_STATE.get("browser_capability", "chat"),
+                        provider=target_provider,
+                        model=slot.get("browser_model") or model,
+                        capability="chat",
                         source="litellm",
                         status="ok",
                         latency_ms=elapsed_ms,
@@ -1394,30 +1797,53 @@ class GeminiBridgeHandler(http.server.BaseHTTPRequestHandler):
                         completion_text=res_content,
                     )
                     self._send_openai_completion(
-                        f"chatcmpl-gemini-{mission_id}",
+                        f"chatcmpl-{target_provider}-{mission_id}",
                         model,
                         is_stream,
                         res_content,
                         prompt_tokens,
                         completion_tokens,
-                        tool_call=parsed_tc,
+                        tool_call=parsed_tcs or None,
                     )
-                else:
+                elif finished and slot.get("error"):
+                    err_msg = slot.pop("error", "Browser worker error")
+                    slot["pending_mission"] = None
                     elapsed_ms = int((time.time() - start_wait) * 1000)
                     record_model_run(
-                        provider=DEBATE_STATE.get("browser_provider", "gemini"),
-                        model=DEBATE_STATE.get("browser_model") or model,
-                        capability=DEBATE_STATE.get("browser_capability", "chat"),
+                        provider=target_provider,
+                        model=slot.get("browser_model") or model,
+                        capability="chat",
+                        source="litellm",
+                        status="error",
+                        latency_ms=elapsed_ms,
+                        prompt_text=raw_user_msg,
+                        completion_text=err_msg,
+                    )
+                    print(f"[\033[91mFEHLER AN LITELLM\033[0m] ({target_provider}) Browser-Fehler: {err_msg}")
+                    self._send_json(503, {
+                        "error": {
+                            "message": err_msg,
+                            "type": "browser_worker_error",
+                            "code": 503
+                        }
+                    })
+                else:
+                    slot["pending_mission"] = None
+                    elapsed_ms = int((time.time() - start_wait) * 1000)
+                    record_model_run(
+                        provider=target_provider,
+                        model=slot.get("browser_model") or model,
+                        capability="chat",
                         source="litellm",
                         status="timeout",
                         latency_ms=elapsed_ms,
                         prompt_text=raw_user_msg,
                         completion_text="",
                     )
-                    print(f"[\033[91mTIMEOUT AN LITELLM\033[0m] Gemini hat innerhalb von {timeout}s nicht geantwortet.")
+                    print(f"[\033[91mTIMEOUT AN LITELLM\033[0m] ({target_provider}) keine Browser-Aktivität seit {idle_for:.1f}s (Gesamt: {total_for:.1f}s).")
                     self._send_json(504, {
                         "error": {
-                            "message": f"Gemini Browser Tandem Timeout nach {timeout}s. Bitte prüfen, ob Tab 1 und Tab 2 im Browser aktiv sind.",
+                            "message": f"{target_provider.capitalize()} Browser Tandem Timeout (Inaktivität: {idle_for:.0f}s, Gesamt: {total_for:.0f}s). Bitte prüfen, ob Worker- und Reviewer-Tab aktiv sind.",
                             "type": "timeout_error",
                             "code": 504
                         }
@@ -1473,7 +1899,7 @@ class GeminiBridgeHandler(http.server.BaseHTTPRequestHandler):
                         "success": True,
                         "file_path": last_img["file_path"],
                         "filename": last_img["filename"],
-                        "image_url": f"http://{os.getenv('BRIDGE_PUBLIC_HOST', 'localhost')}:{PORT}/images/{last_img['filename']}",
+                        "image_url": f"http://127.0.0.1:{PORT}/images/{last_img['filename']}",
                         "mime_type": last_img.get("mime_type", "image/png"),
                         "image_base64": last_img.get("image_base64", ""),
                         "text": DEBATE_STATE.get("final_result", ""),
@@ -1546,13 +1972,33 @@ class GeminiBridgeHandler(http.server.BaseHTTPRequestHandler):
             mission_id = payload.get("id")
             if DEBATE_STATE.get("pending_mission") and DEBATE_STATE["pending_mission"]["id"] == mission_id:
                 DEBATE_STATE["pending_mission"]["status"] = "in_progress"
+            for prov_name, sl in PROVIDER_SLOTS.items():
+                if sl.get("pending_mission") and sl["pending_mission"].get("id") == mission_id:
+                    sl["pending_mission"]["status"] = "in_progress"
+                    sl["last_activity_ts"] = time.time()
             self._send_json(200, {"success": True})
+
+        # ------------------------------------------------------------------
+        # 2b. /init - Startet neuen Chat + API-Harness-Soul im Browser-Tab
+        # ------------------------------------------------------------------
+        elif self.path == "/init":
+            prov = (payload.get("provider") or "claude").strip().lower()
+            soul = payload.get("soul", "")
+            targets = ["gemini", "claude"] if prov == "all" else [prov]
+            results = {}
+            for p in targets:
+                ok, msg = run_provider_init(p, soul, timeout=int(payload.get("timeout", 60)))
+                results[p] = {"ok": ok, "message": msg}
+            all_ok = all(v["ok"] for v in results.values())
+            self._send_json(200 if all_ok else 207, {"success": all_ok, "results": results})
 
         # ------------------------------------------------------------------
         # 3. /finish_mission - Speichert finale Antwort für das Dashboard
         # ------------------------------------------------------------------
         elif self.path == "/finish_mission":
             result = payload.get("result", "")
+            prov = (payload.get("provider") or "gemini").strip().lower() or "gemini"
+            slot = get_provider_slot(prov)
             img_b64 = payload.get("image_base64", "")
             img_mime = payload.get("image_mime", "image/png")
             if img_b64:
@@ -1567,7 +2013,7 @@ class GeminiBridgeHandler(http.server.BaseHTTPRequestHandler):
                     ext = ".jpg"
                 elif "webp" in img_mime:
                     ext = ".webp"
-                fname = f"gemini_{int(time.time() * 1000)}{ext}"
+                fname = f"{prov}_{int(time.time() * 1000)}{ext}"
                 fpath = os.path.join(IMAGES_DIR, fname)
                 try:
                     with open(fpath, "wb") as f:
@@ -1582,13 +2028,17 @@ class GeminiBridgeHandler(http.server.BaseHTTPRequestHandler):
                 except Exception as e:
                     print(f"[\033[91mBILD-FEHLER\033[0m] {e}")
 
+            slot["final_result"] = result
+            slot["error"] = ""
+            slot["pending_mission"] = None
+            slot["done_event"].set()
             DEBATE_STATE["final_result"] = result
             DEBATE_STATE["pending_mission"] = None
             if DEBATE_STATE.get("mission_source") == "dashboard" and DEBATE_STATE.get("mission_started_ts", 0) > 0:
                 elapsed_ms = int((time.time() - DEBATE_STATE["mission_started_ts"]) * 1000)
                 record_model_run(
-                    provider=DEBATE_STATE.get("browser_provider", "gemini"),
-                    model=DEBATE_STATE.get("browser_model", "unknown"),
+                    provider=prov,
+                    model=slot.get("browser_model") or DEBATE_STATE.get("browser_model", "unknown"),
                     capability=DEBATE_STATE.get("browser_capability", "chat"),
                     source="dashboard",
                     status="ok",
@@ -1598,7 +2048,19 @@ class GeminiBridgeHandler(http.server.BaseHTTPRequestHandler):
                 )
                 DEBATE_STATE["mission_started_ts"] = 0.0
             MISSION_COMPLETED_EVENT.set()
-            print(f"\n[\033[92mFERTIG\033[0m] Finale Antwort empfangen und im Dashboard bereitgestellt!")
+            print(f"\n[\033[92mFERTIG\033[0m] ({prov}) Finale Antwort empfangen!")
+            self._send_json(200, {"success": True})
+
+        elif self.path == "/fail_mission":
+            err_msg = (payload.get("error") or "Browser worker failed").strip()
+            prov = (payload.get("provider") or "gemini").strip().lower() or "gemini"
+            slot = get_provider_slot(prov)
+            slot["final_result"] = ""
+            slot["error"] = err_msg
+            slot["pending_mission"] = None
+            slot["done_event"].set()
+            DEBATE_STATE["pending_mission"] = None
+            print(f"\n[\033[91mMISSION-FEHLER\033[0m] ({prov}) {err_msg}")
             self._send_json(200, {"success": True})
 
         # ------------------------------------------------------------------
@@ -1625,6 +2087,15 @@ class GeminiBridgeHandler(http.server.BaseHTTPRequestHandler):
             }
             DEBATE_STATE["events"].append(event)
             append_to_markdown_log(event)
+
+            # Aktivität & automatischer Claude Split-Pane Fokuswechsel
+            claude_slot = PROVIDER_SLOTS.get("claude", {})
+            if claude_slot.get("pending_mission") or not claude_slot.get("done_event", threading.Event()).is_set():
+                claude_slot["last_activity_ts"] = time.time()
+                if role == "reviewer" and ("Anti-Halluzinations-Check" in title or "Review gestartet" in title):
+                    focus_claude_pane("reviewer")
+                elif role in ("coder", "worker") and ("Worker bessert nach" in title):
+                    focus_claude_pane("worker")
 
             color = {
                 "coder": "\033[94m",
@@ -1781,15 +2252,52 @@ class GeminiBridgeHandler(http.server.BaseHTTPRequestHandler):
             except Exception as e:
                 self._send_json(500, {"error": str(e)})
 
+        elif self.path == "/control":
+            action = (payload.get("action") or "reload").strip().lower()
+            prov = (payload.get("provider") or "all").strip().lower()
+            role = (payload.get("role") or "all").strip().lower()
+            tid = (payload.get("tab_id") or "").strip()
+            val = str(payload.get("value") or "")
+            if action not in ("reload", "new_chat", "set_role", "ping"):
+                self._send_json(400, {"error": f"Unknown control action: {action}"})
+                return
+            targets, cmd = queue_tab_command(action, provider=prov, role=role, tab_id=tid, value=val)
+            print(f"[\033[96mCONTROL\033[0m] Action='{action}' für {len(targets)} Tab(s) (provider={prov}, role={role})")
+            self._send_json(200, {"success": True, "targets": targets, "command": cmd})
+
+        elif self.path == "/control/auto_focus":
+            global AUTO_FOCUS_CLAUDE
+            AUTO_FOCUS_CLAUDE = bool(payload.get("enabled", True))
+            print(f"[\033[96mCONTROL\033[0m] AUTO_FOCUS_CLAUDE={AUTO_FOCUS_CLAUDE}")
+            self._send_json(200, {"success": True, "auto_focus_claude": AUTO_FOCUS_CLAUDE})
+
+        elif self.path == "/control/restart":
+            self._send_json(200, {"success": True, "restarting": True})
+            def _do_restart():
+                time.sleep(0.25)
+                try:
+                    if getattr(self.server, "server_close", None):
+                        self.server.server_close()
+                except Exception:
+                    pass
+                os.execv(sys.executable, [sys.executable] + sys.argv)
+            threading.Thread(target=_do_restart, daemon=True).start()
+
         else:
             self._send_json(404, {"error": "Endpoint not found"})
 
     def log_message(self, format, *args):
         return
 
+
+class ReusableThreadingHTTPServer(http.server.ThreadingHTTPServer):
+    allow_reuse_address = True
+    daemon_threads = True
+
+
 def run_server():
     server_address = (HOST, PORT)
-    httpd = http.server.ThreadingHTTPServer(server_address, GeminiBridgeHandler)
+    httpd = ReusableThreadingHTTPServer(server_address, GeminiBridgeHandler)
     print("=" * 65)
     print(f"🎯 \033[1;32mGemini Multi-Agent Mission Control & OpenAI Bridge v3.1 läuft!\033[0m")
     print(f"📍 \033[1;34mDashboard & Mission-Eingabe:\033[0m http://{HOST}:{PORT}/dashboard")

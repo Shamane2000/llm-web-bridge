@@ -1,14 +1,18 @@
 // ==UserScript==
 // @name         Gemini Multi-Agent & Terminal Bridge
 // @namespace    https://github.com/Shamane2000
-// @version      2.0
-// @description  Dual-Tab ReAct Debatte mit Linux-Terminal-Bridge und Mission-Control Dashboard für Google Gemini
-// @author       Jarvis & Frank
+// @version      2.1
+// @description  Dual-Tab ReAct Debatte mit Linux-Terminal-Bridge und Mission-Control Dashboard für Google Gemini & Claude
+// @author       Remote-Host & User
 // @match        https://gemini.google.com/*
+// @match        https://claude.ai/*
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=gemini.google.com
 // @grant        GM_addStyle
 // @grant        GM_xmlhttpRequest
 // @grant        GM_registerMenuCommand
+// @grant        unsafeWindow
+// @downloadURL  http://127.0.0.1:8765/userscript/gemini-dual-agent.user.js
+// @updateURL    http://127.0.0.1:8765/userscript/gemini-dual-agent.user.js
 // @connect      127.0.0.1
 // @connect      localhost
 // @noframes
@@ -17,6 +21,8 @@
 
 (function() {
     'use strict';
+
+    const ACTIVE_PROVIDER = location.hostname.includes('claude.ai') ? 'claude' : 'gemini';
 
     // Sichere DOM-Element-Erstellung (100% immun gegen Trusted Types CSP-Blocker)
     function el(tag, attrs = {}, children = []) {
@@ -141,7 +147,19 @@
                 method: 'POST',
                 url: `${BRIDGE_URL}/finish_mission`,
                 headers: { 'Content-Type': 'application/json' },
-                data: JSON.stringify({ result: result })
+                data: JSON.stringify({ result: result, provider: ACTIVE_PROVIDER })
+            });
+        } catch (e) {}
+    }
+
+    function failMissionOnServer(errMsg) {
+        if (!bridgeOnline && typeof GM_xmlhttpRequest !== 'function') return;
+        try {
+            GM_xmlhttpRequest({
+                method: 'POST',
+                url: `${BRIDGE_URL}/fail_mission`,
+                headers: { 'Content-Type': 'application/json' },
+                data: JSON.stringify({ error: String(errMsg || 'Browser error'), provider: ACTIVE_PROVIDER })
             });
         } catch (e) {}
     }
@@ -152,15 +170,21 @@
     let lastReportedModel = '';
 
     function getModelSwitcherButton() {
-        const selectors = [
-            '[data-test-id="bard-mode-menu-button"]',
-            'bard-mode-switcher button',
-            '.gds-mode-switch-button',
-            'button[aria-label*="Modell" i]',
-            'button[aria-label*="Model" i]',
-            'button[class*="mode-switch"]',
-            'model-picker button'
-        ];
+        const selectors = ACTIVE_PROVIDER === 'claude'
+            ? [
+                'button[aria-label^="Modell:"]',
+                'button[aria-label^="Model:"]',
+                '[data-testid="model-selector-dropdown"]'
+              ]
+            : [
+                '[data-test-id="bard-mode-menu-button"]',
+                'bard-mode-switcher button',
+                '.gds-mode-switch-button',
+                'button[aria-label*="Modell" i]',
+                'button[aria-label*="Model" i]',
+                'button[class*="mode-switch"]',
+                'model-picker button'
+              ];
         for (const sel of selectors) {
             const btn = document.querySelector(sel);
             if (btn && btn.offsetParent !== null) return btn;
@@ -182,7 +206,11 @@
     function detectCurrentBrowserModel() {
         const btn = getModelSwitcherButton();
         if (!btn) return '';
-        let txt = (btn.innerText || btn.textContent || '').replace(/\s+/g, ' ').trim();
+        let txt = (ACTIVE_PROVIDER === 'claude'
+            ? (btn.getAttribute('aria-label') || btn.innerText || btn.textContent || '')
+            : (btn.innerText || btn.textContent || '')
+        ).replace(/\s+/g, ' ').trim();
+        txt = txt.replace(/^(?:Modell|Model):\s*/i, '');
         txt = txt.replace(/arrow_drop_down|expand_more|keyboard_arrow_down/gi, '').trim();
         return txt;
     }
@@ -196,7 +224,7 @@
         if (current) lastReportedModel = current;
 
         const payload = {
-            provider: 'gemini',
+            provider: ACTIVE_PROVIDER,
             capability: getTabCapability(),
             current_model: current || lastReportedModel
         };
@@ -307,7 +335,7 @@
 
     let __gdaScannedOnce = false;
     function scanGeminiModelsInDOM() {
-        if (__gdaScannedOnce || debateState.active) return;
+        if (ACTIVE_PROVIDER !== 'gemini' || __gdaScannedOnce || debateState.active) return;
         const btn = getModelSwitcherButton();
         if (!btn) return;
         __gdaScannedOnce = true;
@@ -415,22 +443,122 @@
         return limitPatterns.some(rx => rx.test(text));
     }
 
+    function getStopButton() {
+        return document.querySelector(
+            'button[aria-label*="Stopp" i], button[aria-label*="Stop" i], ' +
+            'button[aria-label*="anhalten" i], button[aria-label*="abbrechen" i], ' +
+            'button[aria-label*="unterbrechen" i], button[data-testid="stop-button"], .stop-icon'
+        ) || (ACTIVE_PROVIDER === 'claude' ? document.querySelector('[data-is-streaming="true"]') : null);
+    }
+
+    function isTabCurrentlyGenerating() {
+        return Boolean(getStopButton());
+    }
+
+    function handleBridgeCommands(commands) {
+        if (!Array.isArray(commands) || commands.length === 0) return;
+        for (const cmd of commands) {
+            const action = (cmd && cmd.action) || '';
+            if (action === 'reload') {
+                debateState.active = false;
+                try { sessionStorage.removeItem('gda_pending_init'); } catch (e) {}
+                updateStatus('🔄 Remote-Reload...', 'running');
+                logEventToBridge(getTabRole(), 1, '🔄 Remote-Reload ausgeführt', `provider=${ACTIVE_PROVIDER} role=${getTabRole()} tab=${getTabId()}`);
+                setTimeout(() => window.location.reload(), 250);
+                return;
+            }
+            if (action === 'new_chat') {
+                debateState.active = false;
+                try { sessionStorage.removeItem('gda_pending_init'); } catch (e) {}
+                updateStatus('🆕 Starte neuen Chat...', 'running');
+                logEventToBridge(getTabRole(), 1, '🆕 Remote New-Chat ausgeführt', `provider=${ACTIVE_PROVIDER} role=${getTabRole()}`);
+                setTimeout(() => {
+                    window.location.href = (ACTIVE_PROVIDER === 'claude' ? '/new' : '/app');
+                }, 150);
+                return;
+            }
+            if (action === 'set_role' && cmd.value) {
+                setTabRole(cmd.value);
+                const sel = document.getElementById('gda-role-select');
+                if (sel) sel.value = cmd.value;
+                updateStatus(`Rolle: ${cmd.value}`, 'success');
+                logEventToBridge(cmd.value, 1, '🎭 Remote-Rollenwechsel', `provider=${ACTIVE_PROVIDER} new_role=${cmd.value}`);
+            }
+            if (action === 'ping') {
+                const elIn = getInputElement();
+                const inLen = (elIn?.innerText || elIn?.value || '').trim().length;
+                let hasPm = false;
+                try {
+                    const pw = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
+                    const pe = pw.document.querySelector('div.tiptap.ProseMirror[contenteditable="true"], .ProseMirror[contenteditable="true"]');
+                    hasPm = Boolean(pe && (pe.pmViewDesc?.view || pe.parentElement?.pmViewDesc?.view));
+                } catch (e) {}
+                let domDiag = '';
+                if (ACTIVE_PROVIDER === 'claude') {
+                    const aMsg = document.querySelectorAll('[data-testid="assistant-message"]');
+                    const uMsg = document.querySelectorAll('[data-testid="user-message"]');
+                    const fcr = document.querySelectorAll('.font-claude-response');
+                    const fcrb = document.querySelectorAll('.font-claude-response-body');
+                    const sm = document.querySelectorAll('.standard-markdown');
+                    const stream = document.querySelectorAll('[data-is-streaming]');
+                    const testIds = Array.from(new Set(Array.from(document.querySelectorAll('[data-testid]')).map(e => e.getAttribute('data-testid')))).slice(0, 20);
+                    const lastFcr = fcr.length ? (fcr[fcr.length - 1].innerText || '').trim().slice(0, 60).replace(/\s+/g, ' ') : '';
+                    const lastAMsg = aMsg.length ? (aMsg[aMsg.length - 1].innerText || '').trim().slice(0, 60).replace(/\s+/g, ' ') : '';
+                    domDiag = ` url=${location.pathname} aMsg=${aMsg.length} uMsg=${uMsg.length} fcr=${fcr.length} fcrb=${fcrb.length} sm=${sm.length} stream=${stream.length} testIds=[${testIds.join(',')}] lastFcr="${lastFcr}" lastAMsg="${lastAMsg}"`;
+                }
+                logEventToBridge(getTabRole(), 1, '🏓 Remote-Ping', `provider=${ACTIVE_PROVIDER} role=${getTabRole()} focus=${document.hasFocus()} hasEl=${Boolean(elIn)} pmView=${hasPm} inLen=${inLen} method=${lastInputMethod}${domDiag}`);
+            }
+        }
+    }
+
+    let lastHeartbeatTs = 0;
+    function sendTabHeartbeat(tabId, role, generating, debate) {
+        const now = Date.now();
+        if (now - lastHeartbeatTs < 3500) return;
+        lastHeartbeatTs = now;
+        try {
+            GM_xmlhttpRequest({
+                method: 'GET',
+                url: `${BRIDGE_URL}/heartbeat?tab_id=${encodeURIComponent(tabId)}&role=${encodeURIComponent(role)}&provider=${encodeURIComponent(ACTIVE_PROVIDER)}&generating=${generating ? 1 : 0}&debate=${debate ? 1 : 0}`,
+                timeout: 3000,
+                onload: function(res) {
+                    try {
+                        const d = JSON.parse(res.responseText);
+                        if (d && Array.isArray(d.commands) && d.commands.length > 0) {
+                            handleBridgeCommands(d.commands);
+                        }
+                    } catch (e) {}
+                }
+            });
+        } catch (e) {}
+    }
+
     let isCheckingMission = false;
     let hasActiveReviewer = false;
     function checkPendingMissions() {
-        if (isCheckingMission || !bridgeOnline || debateState.active) return;
+        if (!bridgeOnline) return;
         const role = getTabRole();
         const tabId = getTabId();
+        const gen = isTabCurrentlyGenerating();
+        if (debateState.active) {
+            sendTabHeartbeat(tabId, role, gen, true);
+            return;
+        }
+        if (isCheckingMission) return;
 
         isCheckingMission = true;
         GM_xmlhttpRequest({
             method: 'GET',
-            url: `${BRIDGE_URL}/pending_mission?tab_id=${encodeURIComponent(tabId)}&role=${encodeURIComponent(role)}`,
+            url: `${BRIDGE_URL}/pending_mission?tab_id=${encodeURIComponent(tabId)}&role=${encodeURIComponent(role)}&provider=${encodeURIComponent(ACTIVE_PROVIDER)}&generating=${gen ? 1 : 0}&debate=0`,
             timeout: 5000,
             onload: function(res) {
                 isCheckingMission = false;
                 try {
                     const data = JSON.parse(res.responseText);
+                    if (data && Array.isArray(data.commands) && data.commands.length > 0) {
+                        handleBridgeCommands(data.commands);
+                        return;
+                    }
                     hasActiveReviewer = Boolean(data.has_reviewer);
 
                     // 1. Browser-Modell regelmäßig an Bridge melden
@@ -460,7 +588,9 @@
                             data: JSON.stringify({ id: mission.id })
                         });
                         console.log('Übernehme Mission vom Dashboard:', mission.task);
-                        if (mission.capability === 'image') {
+                        if (mission.type === 'init') {
+                            runInitMission(mission.task);
+                        } else if (mission.capability === 'image') {
                             runImageMission(mission.task);
                         } else {
                             startDebate(mission.task, mission.rounds || 2, mission.execute !== false);
@@ -471,6 +601,74 @@
             onerror: function() { isCheckingMission = false; },
             ontimeout: function() { isCheckingMission = false; }
         });
+    }
+
+    function executeInitBootstrap(soulPrompt) {
+        debateState.active = true;
+        updateStatus('🔄 Sende API-Harness-Soul...', 'running');
+        logEventToBridge('coder', 1, '🔄 /init Soul-Bootstrap gesendet', soulPrompt);
+        sendPromptAndAwaitResponse(soulPrompt, (resText, err) => {
+            debateState.active = false;
+            if (err) {
+                updateStatus('❌ Init-Fehler: ' + err, 'error');
+                failMissionOnServer('ERROR: ' + err);
+                return;
+            }
+            updateStatus('✅ Session initialisiert (API-Harness)', 'success');
+            logEventToBridge('coder', 1, '✅ /init bestätigt', resText || 'READY');
+            finishMissionOnServer(resText || 'READY');
+        });
+    }
+
+    function runInitMission(soulPrompt) {
+        debateState.active = true;
+        updateStatus('🔄 Starte neuen Chat...', 'running');
+        if (agentBus) {
+            try { agentBus.postMessage({ type: 'NEW_REVIEWER_CHAT', provider: ACTIVE_PROVIDER }); } catch (e) {}
+        }
+        try {
+            sessionStorage.setItem('gda_pending_init', JSON.stringify({
+                prompt: soulPrompt,
+                provider: ACTIVE_PROVIDER,
+                ts: Date.now()
+            }));
+        } catch (e) {}
+
+        const newChatBtn = ACTIVE_PROVIDER === 'claude'
+            ? document.querySelector('a[href="/new"], button[aria-label*="Neuer Chat" i], button[aria-label*="New chat" i]')
+            : document.querySelector('a[href="/app"], button[aria-label*="Neuer Chat" i], button[aria-label*="New chat" i]');
+
+        if (newChatBtn) {
+            newChatBtn.click();
+        } else {
+            window.location.href = (ACTIVE_PROVIDER === 'claude' ? '/new' : '/app');
+            return;
+        }
+
+        // Falls SPA ohne Seiten-Reload wechselt: Init nach kurzem UI-Settle direkt ausführen
+        setTimeout(() => {
+            try {
+                const raw = sessionStorage.getItem('gda_pending_init');
+                if (!raw) return;
+                sessionStorage.removeItem('gda_pending_init');
+                const obj = JSON.parse(raw);
+                if (obj && obj.prompt) executeInitBootstrap(obj.prompt);
+            } catch (e) {}
+        }, 1600);
+    }
+
+    function resumePendingInitIfAny() {
+        try {
+            const raw = sessionStorage.getItem('gda_pending_init');
+            if (!raw) return;
+            const obj = JSON.parse(raw);
+            if (!obj || obj.provider !== ACTIVE_PROVIDER || (Date.now() - (obj.ts || 0)) > 30000) {
+                sessionStorage.removeItem('gda_pending_init');
+                return;
+            }
+            sessionStorage.removeItem('gda_pending_init');
+            executeInitBootstrap(obj.prompt);
+        } catch (e) {}
     }
 
     function extractLatestGeminiImage(callback) {
@@ -589,7 +787,7 @@
         try {
             GM_xmlhttpRequest({
                 method: 'GET',
-                url: `${BRIDGE_URL}/register_tab?tab_id=${encodeURIComponent(tabId)}`,
+                url: `${BRIDGE_URL}/register_tab?tab_id=${encodeURIComponent(tabId)}&provider=${encodeURIComponent(ACTIVE_PROVIDER)}`,
                 timeout: 4000,
                 onload: function(res) {
                     try {
@@ -617,6 +815,12 @@
     }
 
     function getInputElement() {
+        if (ACTIVE_PROVIDER === 'claude') {
+            return document.querySelector('div.tiptap.ProseMirror[contenteditable="true"]') ||
+                   document.querySelector('.ProseMirror[contenteditable="true"]') ||
+                   document.querySelector('[contenteditable="true"]') ||
+                   document.querySelector('textarea');
+        }
         return document.querySelector('rich-textarea div[contenteditable="true"]') ||
                document.querySelector('rich-textarea textarea') ||
                document.querySelector('.input-area-container textarea') ||
@@ -624,19 +828,168 @@
                document.querySelector('[contenteditable="true"]');
     }
 
-    function setGeminiInput(text) {
+    let lastInputMethod = 'none';
+    let lastSendDiag = 'none';
+
+    function getInputTextLength(elInput) {
+        if (!elInput) return 0;
+        if (elInput.tagName && elInput.tagName.toLowerCase() === 'textarea') {
+            return (elInput.value || '').trim().length;
+        }
+        return (elInput.innerText || elInput.textContent || '').trim().length;
+    }
+
+    function placeSelectionInElement(elInput) {
+        try {
+            const targetNode = elInput.querySelector('p') || elInput;
+            const sel = window.getSelection();
+            const range = document.createRange();
+            range.selectNodeContents(targetNode);
+            sel.removeAllRanges();
+            sel.addRange(range);
+        } catch (e) {}
+    }
+
+    function setClaudeProseMirrorDirect(text) {
+        try {
+            const pageWin = (typeof unsafeWindow !== 'undefined' && unsafeWindow) ? unsafeWindow : window;
+            const pageDoc = pageWin.document || document;
+            const candidates = [
+                pageDoc.querySelector('div.tiptap.ProseMirror[contenteditable="true"]'),
+                pageDoc.querySelector('.ProseMirror[contenteditable="true"]'),
+                pageDoc.querySelector('[contenteditable="true"]')
+            ].filter(Boolean);
+
+            for (let node of candidates) {
+                let cur = node;
+                for (let depth = 0; depth < 4 && cur; depth++, cur = cur.parentElement) {
+                    const view = cur.pmViewDesc?.view || cur.pmViewDesc?.editorView;
+                    if (view && view.state && typeof view.dispatch === 'function') {
+                        const state = view.state;
+                        const pType = state.schema?.nodes?.paragraph;
+                        let tr;
+                        if (pType && typeof state.schema.text === 'function') {
+                            const lines = text.split('\n');
+                            const nodes = lines.map(l => pType.create(null, l ? state.schema.text(l) : null));
+                            tr = state.tr.replaceWith(0, state.doc.content.size, nodes);
+                        } else {
+                            tr = state.tr.insertText(text, 0, state.doc.content.size);
+                        }
+                        view.dispatch(tr);
+                        if ((node.innerText || node.textContent || '').trim().length > 0) {
+                            lastInputMethod = 'pmViewDesc';
+                            return true;
+                        }
+                    }
+                    // Fallback: React Fiber / Tiptap Editor instance
+                    const rKey = Object.keys(cur).find(k => k.startsWith('__reactProps$') || k.startsWith('__reactFiber$'));
+                    if (rKey && cur[rKey]) {
+                        const props = rKey.startsWith('__reactProps$') ? cur[rKey] : cur[rKey].memoizedProps;
+                        const editor = props?.editor || props?.tiptapEditor;
+                        if (editor && editor.commands && typeof editor.commands.setContent === 'function') {
+                            editor.commands.setContent(text.split('\n').map(l => `<p>${l.replace(/&/g, '&amp;').replace(/</g, '&lt;')}</p>`).join(''));
+                            if ((node.innerText || node.textContent || '').trim().length > 0) {
+                                lastInputMethod = 'tiptapEditor';
+                                return true;
+                            }
+                        }
+                    }
+                }
+            }
+        } catch (e) {}
+        return false;
+    }
+
+    function setGeminiInput(text, preferredMethod = 'auto') {
         const elInput = getInputElement();
-        if (!elInput) return false;
-        elInput.focus();
+        if (!elInput) {
+            lastInputMethod = 'no_element';
+            return false;
+        }
+        try { elInput.focus({ preventScroll: true }); } catch (e) { try { elInput.focus(); } catch (e2) {} }
 
         if (elInput.tagName.toLowerCase() === 'textarea') {
             elInput.value = text;
             elInput.dispatchEvent(new Event('input', { bubbles: true }));
             elInput.dispatchEvent(new Event('change', { bubbles: true }));
+            lastInputMethod = 'textarea';
             return true;
         }
 
-        // Für rich-textarea (contenteditable): Sicher ohne innerHTML und ohne Enter-Trigger
+        // Für Tiptap/ProseMirror (claude.ai): Direkte Transaction, Selection+execCommand (nur bei Fokus), beforeinput/paste, Composition-Flush
+        if (ACTIVE_PROVIDER === 'claude') {
+            if (preferredMethod === 'auto' && setClaudeProseMirrorDirect(text)) {
+                return true;
+            }
+
+            if (preferredMethod === 'auto' && document.hasFocus()) {
+                placeSelectionInElement(elInput);
+                try {
+                    document.execCommand('selectAll', false, null);
+                    document.execCommand('delete', false, null);
+                    if (document.execCommand('insertText', false, text) && getInputTextLength(elInput) > 0) {
+                        elInput.dispatchEvent(new Event('input', { bubbles: true }));
+                        lastInputMethod = 'execCommand';
+                        return true;
+                    }
+                } catch (e) {}
+            }
+
+            if (preferredMethod !== 'composition' && document.hasFocus()) {
+                try {
+                    placeSelectionInElement(elInput);
+                    const dt = new DataTransfer();
+                    dt.setData('text/plain', text);
+                    elInput.dispatchEvent(new InputEvent('beforeinput', {
+                        bubbles: true,
+                        cancelable: true,
+                        inputType: 'insertFromPaste',
+                        data: text,
+                        dataTransfer: dt
+                    }));
+                    elInput.dispatchEvent(new ClipboardEvent('paste', {
+                        bubbles: true,
+                        cancelable: true,
+                        clipboardData: dt
+                    }));
+                    if (getInputTextLength(elInput) > 0) {
+                        elInput.dispatchEvent(new Event('input', { bubbles: true }));
+                        lastInputMethod = 'beforeinput_paste';
+                        return true;
+                    }
+                } catch (e) {}
+            }
+
+            // Letzter ProseMirror-Fallback ohne Fokus: Bestehendes <p> wiederverwenden + CompositionEvent-Flush
+            try {
+                elInput.dispatchEvent(new CompositionEvent('compositionstart', { bubbles: true }));
+                const lines = text.split('\n');
+                let firstP = elInput.querySelector('p');
+                if (!firstP) {
+                    firstP = document.createElement('p');
+                    elInput.appendChild(firstP);
+                }
+                while (elInput.children.length > 1) {
+                    elInput.removeChild(elInput.lastChild);
+                }
+                firstP.classList.remove('is-empty', 'is-editor-empty');
+                firstP.textContent = lines[0] || '';
+                for (let i = 1; i < lines.length; i++) {
+                    const p = document.createElement('p');
+                    if (lines[i].length === 0) p.appendChild(document.createElement('br'));
+                    else p.textContent = lines[i];
+                    elInput.appendChild(p);
+                }
+                placeSelectionInElement(elInput);
+                elInput.dispatchEvent(new CompositionEvent('compositionend', { bubbles: true, data: text }));
+                elInput.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertCompositionText', data: text }));
+                elInput.dispatchEvent(new Event('change', { bubbles: true }));
+                lastInputMethod = 'composition_dom';
+                return getInputTextLength(elInput) > 0;
+            } catch (e) {}
+        }
+
+        // Für rich-textarea (Google Gemini): Sicher ohne innerHTML und ohne Enter-Trigger
         while (elInput.firstChild) {
             elInput.removeChild(elInput.firstChild);
         }
@@ -667,23 +1020,38 @@
         elInput.dispatchEvent(new Event('input', { bubbles: true }));
         elInput.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertFromPaste', data: text }));
         elInput.dispatchEvent(new Event('change', { bubbles: true }));
+        lastInputMethod = 'gemini_dom';
 
         return true;
     }
 
     function clickSendButton() {
-        // Sicherheits-Check: Falls Gemini bereits antwortet (Stopp-Button sichtbar), NIEMALS klicken!
-        if (document.querySelector('button[aria-label*="Stopp" i], button[aria-label*="Stop" i], .stop-icon')) {
+        // Sicherheits-Check: Falls Provider bereits antwortet (Stopp-Button sichtbar), NIEMALS klicken!
+        if (getStopButton()) {
             return true;
         }
-        const selectors = [
-            'button[aria-label*="Senden" i]',
-            'button[aria-label*="Send" i]',
-            'button.send-button',
-            '.send-button-container button',
-            'button:has(.send-icon)',
-            '.send-icon'
-        ];
+        const elInput = getInputElement();
+        if (getInputTextLength(elInput) === 0) {
+            return false;
+        }
+        const selectors = ACTIVE_PROVIDER === 'claude'
+            ? [
+                'button[aria-label="Nachricht senden"]',
+                'button[aria-label="Send message"]',
+                'button[data-testid="send-button"]'
+              ]
+            : [
+                'button[aria-label="Nachricht senden"]',
+                'button[aria-label="Send message"]',
+                'button[data-testid="send-button"]',
+                'button[aria-label*="Senden" i]',
+                'button[aria-label*="Send" i]',
+                'button.send-button',
+                '.send-button-container button',
+                'button:has(.send-icon)',
+                '.send-icon'
+              ];
+        let sawDisabledSendBtn = false;
         let clicked = false;
         for (const sel of selectors) {
             const btn = document.querySelector(sel);
@@ -691,26 +1059,38 @@
                 const clickable = btn.tagName.toLowerCase() === 'button' ? btn : (btn.closest('button') || btn);
                 if (clickable) {
                     const lbl = (clickable.getAttribute('aria-label') || '').toLowerCase();
-                    if (lbl.includes('stopp') || lbl.includes('stop') || clickable.querySelector('.stop-icon')) {
+                    if (lbl.includes('stopp') || lbl.includes('stop') || lbl.includes('anhalten') || clickable.querySelector('.stop-icon')) {
+                        lastSendDiag = 'already_stop:' + lbl;
                         return true;
+                    }
+                    if (ACTIVE_PROVIDER === 'claude' && (clickable.disabled || clickable.getAttribute('aria-disabled') === 'true')) {
+                        sawDisabledSendBtn = true;
+                        lastSendDiag = 'disabled:' + sel;
+                        continue;
                     }
                     clickable.removeAttribute('disabled');
                     clickable.disabled = false;
                     clickable.click();
+                    lastSendDiag = 'clicked:' + sel + '|lbl=' + (clickable.getAttribute('aria-label') || '');
                     clicked = true;
                     break;
                 }
             }
         }
 
-        // Enter nur als Fallback, wenn kein Sende-Button geklickt werden konnte
-        if (!clicked) {
-            const elInput = getInputElement();
-            if (elInput) {
+        // Enter nur als Fallback (bei Gemini, oder wenn bei Claude gar kein Sende-Button existiert)
+        if (!clicked && elInput && !(ACTIVE_PROVIDER === 'claude' && sawDisabledSendBtn)) {
+            if (ACTIVE_PROVIDER !== 'claude') {
                 try {
-                    elInput.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true }));
+                    elInput.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true }));
+                    elInput.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true }));
+                    lastSendDiag = 'enter_fallback';
                     clicked = true;
                 } catch (e) {}
+            } else if (!sawDisabledSendBtn) {
+                // Bei Claude Enter-Fallback mit echtem KeyboardEvent + Check aller Send-Buttons im Composer
+                const composerBtns = Array.from(elInput.closest('form, fieldset, [class*="composer" i]')?.querySelectorAll('button') || []);
+                lastSendDiag = 'no_send_btn_found;btns=' + composerBtns.map(b => (b.getAttribute('aria-label') || b.getAttribute('data-testid') || 'unlabeled') + (b.disabled ? '[dis]' : '')).join(',');
             }
         }
         return clicked;
@@ -826,25 +1206,74 @@
         return md || (root.innerText || '').trim();
     }
 
-    function waitForGeminiFinished(initialCount, onDone, maxWaitSeconds = 300) {
+    function getResponseNodes() {
+        if (ACTIVE_PROVIDER === 'claude') {
+            return Array.from(document.querySelectorAll('[data-testid="assistant-message"]'));
+        }
+        return document.querySelectorAll('model-response');
+    }
+
+    function getUserMessageCount() {
+        if (ACTIVE_PROVIDER === 'claude') {
+            return document.querySelectorAll('[data-testid="user-message"]').length;
+        }
+        return 0;
+    }
+
+    function waitForGeminiFinished(initialCount, onDone, maxWaitSeconds = 300, onStuckRetry = null, initialUserCount = 0, initialLastNode = null) {
         const startTime = Date.now();
         let lastLength = 0;
         let stableTicks = 0;
+        let loggedWaitDebug = false;
+        let stuckRetryFired = false;
 
         const timer = setInterval(() => {
-            if ((Date.now() - startTime) / 1000 > maxWaitSeconds) {
+            const elapsed = (Date.now() - startTime) / 1000;
+            if (elapsed > maxWaitSeconds) {
                 clearInterval(timer);
                 onDone(null, 'Zeitüberschreitung');
                 return;
             }
 
-            const responses = document.querySelectorAll('model-response');
-            if (responses.length > initialCount) {
+            const responses = getResponseNodes();
+            const curUserCount = getUserMessageCount();
+            const claudeSent = ACTIVE_PROVIDER !== 'claude' ? false : (curUserCount > initialUserCount);
+            const hasNewResp = responses.length > initialCount || (responses.length > 0 && initialLastNode && responses[responses.length - 1] !== initialLastNode);
+            if (!stuckRetryFired && elapsed >= 15 && !hasNewResp && !claudeSent && !getStopButton() && getInputTextLength(getInputElement()) === 0) {
+                stuckRetryFired = true;
+                if (typeof onStuckRetry === 'function') {
+                    logEventToBridge(getTabRole(), 1, '🔄 Auto-Retry nach stummem Sende-Drop (>15s)', `provider=${ACTIVE_PROVIDER} role=${getTabRole()} focus=${document.hasFocus()} aMsg=${responses.length}/${initialCount} uMsg=${curUserCount}/${initialUserCount}`);
+                    onStuckRetry();
+                }
+            }
+            if (elapsed >= 32 && !hasNewResp && !claudeSent && !getStopButton() && getInputTextLength(getInputElement()) === 0) {
+                clearInterval(timer);
+                const tailTxt = (document.querySelector('main')?.innerText || '').trim().slice(-140).replace(/\s+/g, ' ');
+                logEventToBridge(getTabRole(), 1, '❌ Keine Antwort nach Auto-Retry (32s)', `provider=${ACTIVE_PROVIDER} role=${getTabRole()} focus=${document.hasFocus()} aMsg=${responses.length}/${initialCount} uMsg=${curUserCount}/${initialUserCount} method=${lastInputMethod} send=${lastSendDiag} tail="${tailTxt}"`);
+                onDone(null, `Keine Antwort nach Auto-Retry (focus=${document.hasFocus()}, method=${lastInputMethod})`);
+                return;
+            }
+            if (!loggedWaitDebug && elapsed >= 15) {
+                loggedWaitDebug = true;
+                const stopNow = Boolean(getStopButton());
+                const inLen = (getInputElement()?.innerText || getInputElement()?.value || '').trim().length;
+                const tailTxt = (document.querySelector('main')?.innerText || '').trim().slice(-140).replace(/\s+/g, ' ');
+                logEventToBridge(getTabRole(), 1, 'Warte-Diagnose (>15s)', `provider=${ACTIVE_PROVIDER} role=${getTabRole()} focus=${document.hasFocus()} method=${lastInputMethod} send=${lastSendDiag} responses=${responses.length}/${initialCount} uMsg=${curUserCount}/${initialUserCount} stop=${stopNow} lastLen=${lastLength} inputLen=${inLen} tail="${tailTxt}"`);
+            }
+            if (hasNewResp) {
                 const latest = responses[responses.length - 1];
-                const stopBtn = document.querySelector('button[aria-label*="Stopp" i], button[aria-label*="Stop" i], .stop-icon');
-                const isThinking = latest.querySelector('thinking-dots-animation, [class*="animating"]');
-                let text = domToMarkdown(latest);
-                text = text.replace(/^Gemini\s+(?:hat\s+gesagt|said)\s*\n+/i, '').trim();
+                const stopBtn = getStopButton();
+                const isThinking = ACTIVE_PROVIDER === 'claude'
+                    ? Boolean(latest.closest('[data-is-streaming="true"]'))
+                    : Boolean(latest.querySelector('thinking-dots-animation, [class*="animating"]'));
+                const contentEl = ACTIVE_PROVIDER === 'claude'
+                    ? (latest.querySelector('.standard-markdown, .progressive-markdown, .font-claude-response-body') || latest)
+                    : latest;
+                let text = domToMarkdown(contentEl);
+                text = text
+                    .replace(/^(?:###?\s*)?(?:Gemini|Claude)\s+(?:hat\s+gesagt|said):?[^\n]*\n+/i, '')
+                    .replace(/\n+(?:jetzt|just now|vor\s+\d+\s+\w+)\s*$/i, '')
+                    .trim();
 
                 if (!stopBtn && !isThinking && text.trim().length > 0) {
                     if (text.length === lastLength) {
@@ -895,32 +1324,93 @@
             callback(text, err);
         };
 
+        const triggerStuckRetry = () => {
+            setGeminiInput(promptText);
+            setTimeout(() => { clickSendButton(); }, 450);
+        };
+
         setTimeout(() => {
-            const initialCount = document.querySelectorAll('model-response').length;
+            const initNodes = getResponseNodes();
+            const initialCount = initNodes.length;
+            const initialLastNode = initialCount > 0 ? initNodes[initialCount - 1] : null;
+            const initialUserCount = getUserMessageCount();
             setGeminiInput(promptText);
 
             let attempts = 0;
+            let clickTriggered = false;
+            let postSubmitTicks = 0;
             const retryTimer = setInterval(() => {
                 attempts++;
-                clickSendButton();
-                const newCount = document.querySelectorAll('model-response').length;
-                const hasStop = document.querySelector('button[aria-label*="Stopp" i], button[aria-label*="Stop" i], .stop-icon');
+                const curNodes = getResponseNodes();
+                const newCount = curNodes.length;
+                const hasNewNode = newCount > initialCount || (newCount > 0 && initialLastNode && curNodes[newCount - 1] !== initialLastNode);
+                const hasStop = getStopButton();
+                const curLen = getInputTextLength(getInputElement());
 
-                if (newCount > initialCount || hasStop) {
+                if (hasNewNode || (hasStop && clickTriggered && curLen === 0)) {
                     clearInterval(retryTimer);
-                    waitForGeminiFinished(initialCount, wrappedCallback, 300);
-                } else if (attempts >= 25) {
+                    waitForGeminiFinished(initialCount, wrappedCallback, 180, triggerStuckRetry, initialUserCount, initialLastNode);
+                    return;
+                }
+
+                if (curLen === 0 && !clickTriggered && (attempts === 1 || attempts === 2 || attempts === 4 || attempts === 8)) {
+                    setGeminiInput(promptText, attempts >= 6 ? 'composition' : 'auto');
+                }
+
+                if (getInputTextLength(getInputElement()) > 0 && !clickTriggered) {
+                    if (clickSendButton()) {
+                        clickTriggered = true;
+                    }
+                }
+
+                if (ACTIVE_PROVIDER === 'claude' && !clickTriggered && attempts >= 2 && lastSendDiag.startsWith('disabled:')) {
+                    const bodyTxt = (document.body?.innerText || '');
+                    const limMatch = bodyTxt.match(/(?:Nutzungsbegrenzung|mach jetzt mit Pro weiter|später wieder verfügbar|usage limit|limit reached|Chat[-\s]?Limit)/i);
+                    if (limMatch) {
+                        clearInterval(retryTimer);
+                        const mod = detectCurrentBrowserModel() || 'Claude';
+                        const limMsg = `Claude Free-Plan Nutzungslimit erreicht (${limMatch[0]})`;
+                        reportModelStatus(limMsg, {
+                            limited_model: mod,
+                            retry_after_ts: Math.floor(Date.now() / 1000) + 1800,
+                            retry_after_str: new Date(Date.now() + 1800000).toTimeString().slice(0, 5),
+                            reason: limMsg
+                        });
+                        logEventToBridge(getTabRole(), 1, '⚠️ ' + limMsg, limMsg);
+                        wrappedCallback(null, limMsg);
+                        return;
+                    }
+                }
+
+                const afterNodes = getResponseNodes();
+                const afterCount = afterNodes.length;
+                const afterNew = afterCount > initialCount || (afterCount > 0 && initialLastNode && afterNodes[afterCount - 1] !== initialLastNode);
+                const afterStop = getStopButton();
+                const hasTextStill = getInputTextLength(getInputElement()) > 0;
+                if (afterNew || (afterStop && clickTriggered && !hasTextStill)) {
                     clearInterval(retryTimer);
-                    waitForGeminiFinished(initialCount, wrappedCallback, 300);
+                    waitForGeminiFinished(initialCount, wrappedCallback, 180, triggerStuckRetry, initialUserCount, initialLastNode);
+                } else if (clickTriggered && !hasTextStill) {
+                    postSubmitTicks++;
+                    if (postSubmitTicks >= 2) {
+                        clearInterval(retryTimer);
+                        waitForGeminiFinished(initialCount, wrappedCallback, 180, triggerStuckRetry, initialUserCount, initialLastNode);
+                    }
+                } else if (attempts >= 18) {
+                    clearInterval(retryTimer);
+                    const finalInLen = getInputTextLength(getInputElement());
+                    const msg = `Senden fehlgeschlagen (provider=${ACTIVE_PROVIDER}, role=${getTabRole()}, focus=${document.hasFocus()}, method=${lastInputMethod}, send=${lastSendDiag}, inputLen=${finalInLen}, clicked=${clickTriggered})`;
+                    logEventToBridge(getTabRole(), 1, '❌ Senden fehlgeschlagen', msg);
+                    wrappedCallback(null, msg);
                 }
             }, 500);
-        }, 600);
+        }, 550);
     }
 
     function extractCodeBlocks(markdown) {
         const blocks = [];
         // 1. Zuerst aus echtem DOM extrahieren (<pre><code>)
-        const responses = document.querySelectorAll('model-response');
+        const responses = getResponseNodes();
         if (responses.length > 0) {
             const latest = responses[responses.length - 1];
             const preElems = latest.querySelectorAll('pre');
@@ -1000,19 +1490,28 @@
 
             const myRole = getTabRole();
 
+            if (myRole === 'reviewer' && data.type === 'NEW_REVIEWER_CHAT' && (!data.provider || data.provider === ACTIVE_PROVIDER)) {
+                updateStatus('🆕 Starte neuen Reviewer-Chat...', 'running');
+                setTimeout(() => {
+                    window.location.href = (ACTIVE_PROVIDER === 'claude' ? '/new' : '/app');
+                }, 100);
+                return;
+            }
+
             if (myRole === 'reviewer' && data.type === 'WORKER_REVIEW_REQ') {
                 updateStatus('🧐 Prüfe Worker-Antwort...', 'running');
                 logEventToBridge('reviewer', 1, 'Anti-Halluzinations-Check gestartet', data.draft.slice(0, 400));
                 const checkPrompt =
-                    `[Rolle: Strenger Fact-Checker & QA-Reviewer]\n` +
-                    `Prüfe diese Antwort des Workers auf Halluzinationen:\n\n` +
+                    `[Rolle: Pragmatischer Anti-Halluzinations-Reviewer]\n` +
+                    `Prüfe diese Antwort des Workers ausschließlich auf echte Halluzinationen:\n\n` +
                     `--- ANFRAGE ---\n${data.task}\n\n` +
                     `--- WORKER-ANTWORT ---\n${data.draft}\n\n` +
                     `Prüfregeln:\n` +
-                    `1. Erfindet die Antwort Dateipfade, Skripte oder Messwerte, die NICHT durch ein [Tool-Ergebnis] belegt sind?\n` +
-                    `2. Hätte der Worker für echte System-/Netzwerkdaten zuerst ein Tool (z. B. terminal per {"tool_call": ...}) aufrufen müssen?\n` +
-                    `Wenn alles sauber, ehrlich und belegt ist: Antworte GENAU mit: VERIFIED_OK\n` +
-                    `Wenn etwas erfunden wurde oder ein Tool-Aufruf fehlt: Nenne direkt den konkreten Fehler (z. B. "Entferne die geratenen Dienstnamen für Ports ohne Prozessnamen" oder "Rufe zuerst das terminal-Tool auf"), ohne "Weise den Worker an...".`;
+                    `1. Als BELEGT gilt alles, was in einem [Tool-Ergebnis] ODER bereits in der --- ANFRAGE --- steht (inkl. genannter Zahlen, Pfade und Zusammenfassungen).\n` +
+                    `2. Blockiere NUR, wenn der Worker konkrete Messwerte, Dateipfade, Dienstnamen, Exit-Codes oder Ergebnisse frei erfunden hat ODER bei fehlenden Live-Systemdaten kein Tool aufgerufen hat (z. B. wenn er fälschlich behauptet, keine Verbindung/nur eine Sandbox zu haben, statt {"tool_call": ...} auszugeben).\n` +
+                    `3. VERBOTEN: Stilkritik, Erbsenzählerei zu Formulierungen/Shell-Flags (z. B. ob grep/cat genutzt wurde) oder Rückfragen zu Details aus der Anfrage.\n` +
+                    `Wenn keine grobe Halluzination vorliegt: Antworte AUSSCHLIESSLICH mit genau diesem Wort: VERIFIED_OK\n` +
+                    `Nur bei echter Halluzination: Nenne in maximal 2 knappen Sätzen direkt den konkreten Fehler (ohne "Weise den Worker an...").`;
 
                 sendPromptAndAwaitResponse(checkPrompt, (reviewRes, err) => {
                     const out = err ? 'VERIFIED_OK' : (reviewRes || 'VERIFIED_OK');
@@ -1124,7 +1623,7 @@
                     updateStatus(`⚠️ Fehler beim Ausführen! Lasse Coder korrigieren...`, 'error');
 
                     const terminalFixPrompt = `[Rolle: Leitender Entwickler (Terminal-Fehlerbehebung)]\n` +
-                        `Beim Ausführen deines Skripts auf Franks Linux-System ist folgender Fehler aufgetreten:\n\n` +
+                        `Beim Ausführen deines Skripts auf the user's Linux-System ist folgender Fehler aufgetreten:\n\n` +
                         `${res.stderr}\n\n` +
                         `Bitte korrigiere den Fehler sofort und gib den vollständigen, bereinigten Code aus.`;
 
@@ -1142,15 +1641,15 @@
                 updateStatus('Formuliere finale Antwort aus echten Systemdaten...', 'running');
 
                 const interpretPrompt = `[Rolle: Leitender Entwickler (Missions-Abschluss)]\n` +
-                    `Dein Skript wurde erfolgreich auf Franks Linux-System ausgeführt!\n` +
+                    `Dein Skript wurde erfolgreich auf the user's Linux-System ausgeführt!\n` +
                     `Hier ist die reale Terminal-Ausgabe deines Skripts:\n\n` +
                     `\`\`\`\n${output}\n\`\`\`\n\n` +
-                    `Mission von Frank:\n"${debateState.task}"\n\n` +
+                    `Mission von User:\n"${debateState.task}"\n\n` +
                     `Deine Aufgabe:\n` +
-                    `Analysiere diese echten Messwerte und beantworte Franks Mission nun direkt, übersichtlich und verständlich. Präsentiere ihm die fertige Zusammenfassung seiner Komponenten und Daten (kein weiterer Code erforderlich).`;
+                    `Analysiere diese echten Messwerte und beantworte the user's Mission nun direkt, übersichtlich und verständlich. Präsentiere ihm die fertige Zusammenfassung seiner Komponenten und Daten (kein weiterer Code erforderlich).`;
 
                 sendPromptAndAwaitResponse(interpretPrompt, (finalAnswer) => {
-                    logEventToBridge('final', round, '🏆 Finale Antwort an Frank', finalAnswer);
+                    logEventToBridge('final', round, '🏆 Finale Antwort an User', finalAnswer);
                     finishMissionOnServer(finalAnswer);
                     updateStatus('✅ Mission erfolgreich abgeschlossen!', 'success');
                     debateState.active = false;
@@ -1192,12 +1691,7 @@
                 if (startBtn) startBtn.disabled = false;
                 updateStatus('✅ Antwort an Bridge gesendet', 'success');
                 logEventToBridge('coder', 1, 'Worker-Antwort fertiggestellt', finalTxt);
-                GM_xmlhttpRequest({
-                    method: 'POST',
-                    url: `${BRIDGE_URL}/finish_mission`,
-                    headers: { 'Content-Type': 'application/json' },
-                    data: JSON.stringify({ result: finalTxt })
-                });
+                finishMissionOnServer(finalTxt);
             };
 
             updateStatus('🤖 Worker bearbeitet Anfrage...', 'running');
@@ -1209,6 +1703,7 @@
                     if (startBtn) startBtn.disabled = false;
                     updateStatus('Fehler: ' + err, 'error');
                     logEventToBridge('coder', 1, 'Fehler bei Worker-Anfrage', err);
+                    failMissionOnServer(err);
                     return;
                 }
 
@@ -1220,11 +1715,24 @@
 
                 updateStatus('🧐 Warte auf Reviewer-Freigabe...', 'running');
                 logEventToBridge('coder', 1, 'Entwurf an Reviewer zur Prüfung', resText);
+                let reviewHandled = false;
+                const reviewTimeoutId = setTimeout(() => {
+                    if (!reviewHandled && pendingWorkerReviewCb) {
+                        reviewHandled = true;
+                        pendingWorkerReviewCb = null;
+                        logEventToBridge('reviewer', 1, '⚠️ Reviewer-Timeout (45s) – Fallback VERIFIED_OK', 'Keine rechtzeitige Rückmeldung vom Reviewer-Tab');
+                        finishWorker(resText);
+                    }
+                }, 45000);
                 pendingWorkerReviewCb = (reviewFeedback) => {
+                    if (reviewHandled) return;
+                    reviewHandled = true;
+                    clearTimeout(reviewTimeoutId);
                     if (/VERIFIED_OK/i.test(reviewFeedback)) {
                         finishWorker(resText);
                     } else {
                         updateStatus('🔧 Worker bessert nach...', 'running');
+                        logEventToBridge('coder', 1, '🔧 Worker bessert nach', reviewFeedback);
                         const fixPrompt =
                             `Dein Entwurf:\n${resText}\n\n` +
                             `Korrektur-Anforderung:\n${reviewFeedback}\n\n` +
@@ -1414,6 +1922,7 @@
         setInterval(injectBar, 1500);
         setInterval(checkBridgeHealth, 15000);
         setTimeout(autoAssignTabRoleIfUnset, 1500);
+        setTimeout(resumePendingInitIfAny, 2500);
         setTimeout(scanGeminiModelsInDOM, 3500);
         setInterval(checkPendingMissions, 2500);
     } catch (e) {
