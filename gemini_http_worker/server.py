@@ -7,10 +7,11 @@ import uuid
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
 from .gemini_client import GeminiClient, SessionExpiredError
+from .session_store import get_session_status, save_session
 from .tool_parser import extract_tool_calls
 
 app = FastAPI(title="Gemini HTTP Worker", version="0.1.0")
@@ -167,6 +168,66 @@ async def chat_completions(request: Request, body: ChatCompletionRequest):
         "choices": [{"index": 0, "message": msg_obj, "finish_reason": finish_reason}],
         "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
     }
+
+
+@app.get("/login", response_class=HTMLResponse)
+async def login_page():
+    status = get_session_status()
+    color = "#34a853" if status["status"] == "ACTIVE" else "#ea4335"
+    icon = "✅" if status["status"] == "ACTIVE" else "⚠️"
+    return """<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>Gemini Session Login</title>
+<style>
+  body {{ font-family: system-ui, sans-serif; background: #1e1e1e; color: #e0e0e0; display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; }}
+  .card {{ background: #2d2d2d; padding: 2rem; border-radius: 12px; max-width: 500px; box-shadow: 0 4px 20px rgba(0,0,0,0.5); }}
+  h1 {{ margin-top: 0; font-size: 1.5rem; }}
+  .status {{ padding: 1rem; border-radius: 8px; margin: 1rem 0; font-weight: bold; }}
+  .steps {{ line-height: 1.8; }}
+  code {{ background: #3c3c3c; padding: 2px 6px; border-radius: 4px; font-size: 0.9em; }}
+  a {{ color: #8ab4f8; }}
+  .btn {{ display: inline-block; margin-top: 1rem; padding: 10px 20px; background: #1a73e8; color: white; text-decoration: none; border-radius: 6px; font-weight: bold; }}
+  .btn:hover {{ background: #1557b0; }}
+</style></head><body>
+<div class="card">
+  <h1>{icon} Gemini Session Manager</h1>
+  <div class="status" style="background: {color}22; border-left: 4px solid {color};">
+    Status: {status_text}<br>
+    <small>{message}</small>
+  </div>
+  <div class="steps">
+    <strong>Anleitung:</strong><br>
+    1. Öffne <a href="https://gemini.google.com" target="_blank">gemini.google.com</a> und melde dich an.<br>
+    2. Installiere das Userscript <code>gemini-session-export.user.js</code> in Tampermonkey/Violentmonkey.<br>
+    3. Klicke auf der Gemini-Seite oben rechts auf <strong>„🔄 Sync Session“</strong>.<br>
+    4. Nach Erfolg erscheint hier automatisch der grüne Status.
+  </div>
+  <a class="btn" href="https://gemini.google.com" target="_blank">Gemini öffnen</a>
+</div>
+<script>
+  // Auto-refresh every 10s to pick up sync
+  setTimeout(() => location.reload(), 10000);
+</script>
+</body></html>""".format(
+        icon=icon,
+        color=color,
+        status_text=status["status"],
+        message=status["message"],
+    )
+
+
+class SessionSyncRequest(BaseModel):
+    cookies: dict[str, str]
+    snlm0e: str | None = None
+
+
+@app.post("/session/sync")
+async def session_sync(req: SessionSyncRequest):
+    required = {"__Secure-1PSID", "__Secure-1PSIDTS"}
+    missing = required - req.cookies.keys()
+    if missing:
+        raise HTTPException(status_code=400, detail=f"Missing required cookies: {missing}")
+    save_session(req.cookies, req.snlm0e)
+    return {"status": "ok", "message": "Session saved successfully."}
 
 
 @app.get("/health")

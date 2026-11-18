@@ -7,6 +7,8 @@ from typing import Any
 
 from curl_cffi import requests as cffi_requests
 
+from .session_store import load_session
+
 GEMINI_BASE = "https://gemini.google.com"
 GEMINI_API = f"{GEMINI_BASE}/_/GeminiUi/data/batchexecute"
 USER_AGENT = (
@@ -37,6 +39,20 @@ class GeminiClient:
         if not required.issubset(cookies.keys()):
             raise SessionExpiredError(f"Missing required cookies: {required - cookies.keys()}")
         return cls(cookies)
+
+    @classmethod
+    def from_store(cls) -> GeminiClient | None:
+        """Load client from persisted session store. Returns None if no valid session."""
+        session = load_session()
+        if not session:
+            return None
+        cookies = session.get("cookies", {})
+        snlm0e = session.get("snlm0e")
+        try:
+            client = cls(cookies, snlm0e=snlm0e)
+            return client
+        except SessionExpiredError:
+            return None
 
     def _ensure_token(self) -> str:
         if self.snlm0e:
