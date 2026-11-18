@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gemini-http-worker"
+version = "0.1.0"
+description = "Slim Gemini Web HTTP bridge via curl_cffi (OpenAI-compatible)"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.115.0",
+    "uvicorn>=0.32.0",
+    "curl-cffi>=0.7.0",
+    "pydantic>=2.9.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "ruff>=0.7.0", "httpx>=0.27.0"]
+
+[tool.setuptools.packages.find]
+include = ["gemini_http_worker*"]
+exclude = ["gemini_http_worker.tests*", "benchmarks*", "userscript*", "examples*"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+
+[tool.pytest.ini_options]
+testpaths = ["gemini_http_worker/tests"]

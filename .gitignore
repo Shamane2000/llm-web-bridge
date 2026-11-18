@@ -7,3 +7,9 @@ __pycache__/
 images/
 scratch/
 *.log
+
+# dev artifacts
+.venv/
+.pytest_cache/
+__pycache__/
+*.egg-info/
