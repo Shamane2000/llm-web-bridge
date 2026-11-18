@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Gemini Session Export (HttpOnly)
 // @namespace    http://tampermonkey.net/
-// @version      1.2
+// @version      1.3
 // @description  Exports HttpOnly Gemini cookies to local server via GM_cookie
 // @match        https://gemini.google.com/*
 // @grant        GM_cookie
@@ -34,6 +34,9 @@
                 log("Fehler beim Lesen der Cookies: " + error);
                 return;
             }
+
+            // Debug: nur NAMEN der gefundenen Cookies ausgeben (keine Werte!)
+            log("Gefundene Cookie-Namen: " + cookies.map(c => c.name).join(", "));
 
             const required = ["__Secure-1PSID", "__Secure-1PSIDTS"];
             const cookieMap = {};
