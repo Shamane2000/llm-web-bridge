@@ -15,7 +15,7 @@
     "use strict";
 
     // Konfiguration: Server-Endpunkt anpassen falls nötig
-    const SERVER_URL = "http://192.168.1.154:8000/session/sync";
+    const SERVER_URL = "http://192.168.1.154:8766/session/sync";
 
     function log(msg) {
         console.log("[GeminiSessionExport] " + msg);

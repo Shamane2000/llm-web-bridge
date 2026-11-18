@@ -88,5 +88,5 @@ def get_session_status() -> dict[str, Any]:
         "age_hours": round(age_hours, 1),
         "has_snlm0e": has_snlm0e,
         "psid_redacted": redact(session["cookies"].get("__Secure-1PSID")),
-        "message": f"Session active ({age_hours:.1f}h old). SNlM0e: {"Y" if has_snlm0e else "N"}",
+        "message": f"Session active ({age_hours:.1f}h old). SNlM0e: {'Y' if has_snlm0e else 'N'}",
     }

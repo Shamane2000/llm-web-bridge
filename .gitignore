@@ -13,3 +13,7 @@ scratch/
 .pytest_cache/
 __pycache__/
 *.egg-info/
+-e 
+# Gemini session store (contains live cookies)
+.data/
+.data/gemini_session.json
