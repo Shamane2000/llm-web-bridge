@@ -1,11 +1,12 @@
 // ==UserScript==
 // @name         Gemini Session Export (HttpOnly)
 // @namespace    http://tampermonkey.net/
-// @version      1.1
+// @version      1.2
 // @description  Exports HttpOnly Gemini cookies to local server via GM_cookie
 // @match        https://gemini.google.com/*
 // @grant        GM_cookie
 // @grant        GM_xmlhttpRequest
+// @grant        GM_registerMenuCommand
 // @connect      localhost
 // @connect      192.168.1.154
 // @run-at       document-idle
@@ -115,5 +116,10 @@
         createUI();
     } else {
         window.addEventListener("load", createUI);
+    }
+
+    // Robuster Fallback: Tampermonkey-Menü (Icon in der Browser-Leiste anklicken)
+    if (typeof GM_registerMenuCommand !== "undefined") {
+        GM_registerMenuCommand("Sync Gemini Session", exportSession);
     }
 })();
